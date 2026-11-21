@@ -825,8 +825,39 @@ fn fallback_table() -> &'static Vec<Mutex<HashMap<u64, S>>> {
     FALLBACK_IDS.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect())
 }
 
+/// Per byte of `w` (all bytes < 0x80): 0x80 where lo <= byte <= hi, else 0.
+#[inline(always)]
+fn in_range8(w: u64, lo: u8, hi: u8) -> u64 {
+    let ge = w.wrapping_add(rep8(0x80 - lo)); // bit 7 set iff byte >= lo
+    let gt = w.wrapping_add(rep8(0x7F - hi)); // bit 7 set iff byte > hi
+    ge & !gt & rep8(0x80)
+}
+
 #[inline]
 fn enc(s: &[u8]) -> Id {
+    let n = s.len();
+    // The common shape (a first byte and 8 or 9 more from [0-9a-z]) word-at-a-time: check and
+    // convert bytes 1..9 at once, then combine the base-37 digits in three multiply steps.
+    if n == 9 || n == 10 {
+        let w = ld8(s, 1);
+        let digit = in_range8(w, b'0', b'9');
+        let lower = in_range8(w, b'a', b'z');
+        let d9 = if n == 10 { B37[s[9] as usize] as u64 } else { 0 };
+        if w & rep8(0x80) == 0 && (digit | lower) == rep8(0x80) && (n == 9 || d9 != 0) {
+            // '0'..'9' -> 1..10, 'a'..'z' -> 11..36 (byte 0 of w is the most significant digit)
+            let x = w.wrapping_sub(rep8(0x2F)).wrapping_sub((lower >> 7).wrapping_mul(0x27));
+            let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(37).wrapping_add((x >> 8) & 0x00FF_00FF_00FF_00FF);
+            let x = (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(37 * 37).wrapping_add((x >> 16) & 0x0000_FFFF_0000_FFFF);
+            let x = (x & 0xFFFF_FFFF).wrapping_mul(37 * 37 * 37 * 37).wrapping_add(x >> 32);
+            return Id(((s[0] as u64) << 47) | (x * 37 + d9));
+        }
+    }
+    enc_ref(s)
+}
+
+/// `enc` byte at a time (all shapes). The self-test checks `enc` against it.
+#[inline]
+fn enc_ref(s: &[u8]) -> Id {
     let n = s.len();
     if (1..=10).contains(&n) {
         let mut v: u64 = 0;
@@ -1951,8 +1982,31 @@ fn id_selftest() {
             fails += 1;
         }
     }
+    // the word-at-a-time path against the byte-at-a-time one, incl. bytes just outside the ranges
+    for s in &leaked {
+        if enc(s) != enc_ref(s) {
+            fails += 1;
+        }
+    }
+    let edge: &[u8] = b"09az/:`{\x7f\x80\xff\x00AZ_";
+    let mut efails = 0;
+    for i in 0..400_000u64 {
+        let len = 9 + (i % 2) as usize;
+        let mut s = Vec::with_capacity(len);
+        for j in 0..len {
+            let r = rnd();
+            s.push(if j > 0 && r % 12 == 0 { edge[(r >> 8) as usize % edge.len()] } else { alpha[(r >> 8) as usize % alpha.len()] });
+        }
+        if enc(&s) != enc_ref(&s) {
+            efails += 1;
+            if efails <= 5 {
+                eprintln!("  enc mismatch {:?}", String::from_utf8_lossy(&s));
+            }
+        }
+    }
+    let fails = fails + efails;
     let canon = ids.iter().filter(|i| !is_long(**i)).count();
-    eprintln!("id selftest: {n} strings ({canon} canonical), failures: {fails}");
+    eprintln!("id selftest: {n} strings ({canon} canonical) + 400000 enc-vs-ref, failures: {fails}");
     // timestamps: fast parser vs byte-at-a-time reference
     let mut tfails = 0u64;
     let mut tvalid = 0u64;
