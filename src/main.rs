@@ -1289,8 +1289,11 @@ fn build_links(files: Vec<FileRef>) -> LinkTab {
 /// Renamed id -> person, as open addressing over 16-byte entries: one region per bucket (so
 /// regions build in parallel), linear probing inside it. A lookup is usually one cache line,
 /// which `prefetch` can fetch ahead of time.
+/// All regions lie in one run of arena memory (huge pages, so random lookups don't also miss
+/// the TLB): region b is `tab[b << shift ..][..size]`.
 struct LinkTab {
-    regions: Vec<Box<[(u64, u64)]>>,
+    tab: &'static [(u64, u64)],
+    shift: u32,
     mask: usize,
     max_key: Option<Id>, // the person of id u64::MAX (the empty marker), if renamed
 }
@@ -1299,28 +1302,34 @@ const EMPTY: u64 = u64::MAX;
 
 impl LinkTab {
     fn build(per_bucket: Vec<Vec<(Id, Id)>>) -> LinkTab {
+        assert_eq!(per_bucket.len(), NB);
         let most = per_bucket.iter().map(|v| v.len()).max().unwrap_or(0);
         let size = (most * 2).next_power_of_two().max(8); // load factor <= 1/2
-        let mask = size - 1;
+        let (mask, shift) = (size - 1, size.trailing_zeros());
         let max_key = per_bucket.iter().flatten().find(|(k, _)| k.0 == EMPTY).map(|&(_, v)| v);
-        let regions = per_bucket
-            .into_par_iter()
-            .map(|list| {
-                let mut r = filled(size, (EMPTY, 0u64)).into_boxed_slice();
-                for (k, v) in list {
-                    if k.0 == EMPTY {
-                        continue;
-                    }
-                    let mut i = mix(k) as usize & mask;
-                    while r[i].0 != EMPTY {
-                        i = (i + 1) & mask;
-                    }
-                    r[i] = (k.0, v.0);
+        let base = huge_alloc(NB * size * 16) as usize;
+        per_bucket.into_par_iter().enumerate().for_each(|(b, list)| {
+            // SAFETY: region b is this task's alone, inside memory just taken from the arena
+            let r = unsafe { std::slice::from_raw_parts_mut((base as *mut (u64, u64)).add(b << shift), size) };
+            r.fill((EMPTY, 0));
+            for (k, v) in list {
+                if k.0 == EMPTY {
+                    continue;
                 }
-                r
-            })
-            .collect();
-        LinkTab { regions, mask, max_key }
+                let mut i = mix(k) as usize & mask;
+                while r[i].0 != EMPTY {
+                    i = (i + 1) & mask;
+                }
+                r[i] = (k.0, v.0);
+            }
+        });
+        let tab = unsafe { std::slice::from_raw_parts(base as *const (u64, u64), NB * size) };
+        LinkTab { tab, shift, mask, max_key }
+    }
+
+    #[inline(always)]
+    fn slot(&self, u: Id) -> usize {
+        (bucket(u) << self.shift) | (mix(u) as usize & self.mask)
     }
 
     #[inline(always)]
@@ -1328,8 +1337,7 @@ impl LinkTab {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let r = self.regions.get_unchecked(bucket(u));
-            _mm_prefetch::<_MM_HINT_T0>(r.as_ptr().add(mix(u) as usize & self.mask) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(self.tab.as_ptr().add(self.slot(u)) as *const i8);
         }
     }
 
@@ -1339,10 +1347,10 @@ impl LinkTab {
         if u.0 == EMPTY {
             return self.max_key.unwrap_or(u);
         }
-        let r = unsafe { self.regions.get_unchecked(bucket(u)) };
-        let mut i = mix(u) as usize & self.mask;
+        let s = self.slot(u);
+        let (r0, mut i) = (s & !self.mask, s & self.mask);
         loop {
-            let (k, v) = unsafe { *r.get_unchecked(i) };
+            let (k, v) = unsafe { *self.tab.get_unchecked(r0 | i) };
             if k == u.0 {
                 return Id(v);
             }
@@ -1356,7 +1364,7 @@ impl LinkTab {
 
 /// Lines waiting for their link-table entry to arrive in cache: a line is finished RING lines
 /// after its entry was prefetched.
-const RING: usize = 16;
+const RING: usize = 32;
 
 struct Ring<P: Copy> {
     q: [P; RING],
