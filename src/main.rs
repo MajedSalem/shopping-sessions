@@ -305,6 +305,115 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     parse_ts_ref(b)
 }
 
+/// `parse_ts` with a memo of validated dates. A dataset's timestamps fall on a few dozen dates,
+/// so after the first few lines the `YYYY-MM-DD` part (validation, calendar, day number) is a
+/// lookup keyed by its exact 10 bytes, and only `THH:MM:SS` and the zone are checked and
+/// computed. Entries are only ever made from dates that passed full validation, and a hit
+/// needs all 10 bytes equal, so results are exactly `parse_ts`'s. One per task (not shared).
+struct TsParser {
+    memo: [(u64, u16, i32); 64], // (bytes 0..8, bytes 8..10, days since epoch); w0 = 0 is empty
+}
+
+impl TsParser {
+    fn new() -> Self {
+        TsParser { memo: [(0, 0, 0); 64] }
+    }
+
+    #[inline]
+    fn parse(&mut self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if (n == 20 || n == 25) && b[4] == b'-' {
+            return self.iso(b);
+        }
+        parse_ts(b)
+    }
+
+    /// F1 / F2 (length 20 or 25 checked by the caller). Same rules as `parse_iso`.
+    #[inline]
+    fn iso(&mut self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        let w0 = ld8(b, 0); // "YYYY-MM-"
+        let w1 = ld8(b, 8); // "DDTHH:MM"
+        let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64; // ":SS" + zone byte
+        let dd = (w1 & 0xFFFF) as u16;
+        let slot = ((dd ^ (dd >> 7) ^ ((w0 >> 40) as u16)) & 63) as usize; // day and month digits
+        let e = self.memo[slot];
+        let days = if e.0 == w0 && e.1 == dd {
+            e.2 as i64
+        } else {
+            let d = date_days(w0, w1)?;
+            self.memo[slot] = (w0, dd, d as i32);
+            d
+        };
+        // time: 'T' at 10, ':' at 13 and 16, digits at 11, 12, 14, 15, 17, 18
+        const MS1: u64 = 0x0000_FF00_00FF_0000;
+        const T1: u64 = ((b'T' as u64) << 16) | ((b':' as u64) << 40);
+        const MD1: u64 = 0xFFFF_00FF_FF00_0000;
+        const MD2: u64 = 0x00FF_FF00;
+        if !((w1 & MS1) == T1 && (w2 & 0xFF) == b':' as u64 && digits_ok(w1, MD1) && digits_ok(w2, MD2)) {
+            return None;
+        }
+        let by = |w: u64, k: u32| (((w >> (8 * k)) & 0xFF) as i64) - b'0' as i64;
+        let h = by(w1, 3) * 10 + by(w1, 4);
+        let mi = by(w1, 6) * 10 + by(w1, 7);
+        let s = by(w2, 1) * 10 + by(w2, 2);
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        let off = if n == 20 {
+            if b[19] != b'Z' {
+                return None;
+            }
+            0
+        } else {
+            let sign = match b[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if b[22] != b':' {
+                return None;
+            }
+            let oh = d2(b, 20)?;
+            let om = d2(b, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            sign * (oh * 60 + om)
+        };
+        Some((days * 86400 + h * 3600 + mi * 60 + s - off * 60) * 1000)
+    }
+}
+
+/// Days since the epoch of the `YYYY-MM-DD` in w0 ("YYYY-MM-") and the low two bytes of w1,
+/// or None if it isn't a valid date.
+#[inline(never)]
+fn date_days(w0: u64, w1: u64) -> Option<i64> {
+    const MD0: u64 = 0x00FF_FF00_FFFF_FFFF; // digits at 0-3, 5, 6
+    const MS0: u64 = 0xFF00_00FF_0000_0000; // '-' at 4 and 7
+    const T0: u64 = ((b'-' as u64) << 32) | ((b'-' as u64) << 56);
+    if !((w0 & MS0) == T0 && digits_ok(w0, MD0) && digits_ok(w1, 0xFFFF)) {
+        return None;
+    }
+    let by = |w: u64, k: u32| (((w >> (8 * k)) & 0xFF) as i64) - b'0' as i64;
+    let y = by(w0, 0) * 1000 + by(w0, 1) * 100 + by(w0, 2) * 10 + by(w0, 3);
+    let mo = by(w0, 5) * 10 + by(w0, 6);
+    let d = by(w1, 0) * 10 + by(w1, 1);
+    if !(1..=12).contains(&mo) || d < 1 {
+        return None;
+    }
+    let leap = is_leap(y);
+    let dim = match mo {
+        2 => 28 + leap as i64,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
     if b.is_empty() {
@@ -1595,20 +1704,21 @@ fn main() {
 }
 
 fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, out: &Writers<EvRaw>) {
+    let mut tp = TsParser::new();
     out.with(|w| scan::<7>(c, |f| {
         let eid = f[0];
         if eid.is_empty() {
             return;
         }
         let eid = enc(eid);
-        let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
+        let ingest_ms = tp.parse(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut r = EvRaw { eid, user: Id::default(), ingest, ts: INVALID, pc: 0 };
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let ts = match parse_ts(f[2]) {
+            let ts = match tp.parse(f[2]) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -1634,11 +1744,12 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
 }
 
 fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, out: &Writers<ClickRec>) {
+    let mut tp = TsParser::new();
     out.with(|w| scan::<4>(c, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let ts = match parse_ts(f[3]) {
+        let ts = match tp.parse(f[3]) {
             Some(t) if t >= cws && t < we => t,
             _ => return,
         };
@@ -1845,13 +1956,16 @@ fn id_selftest() {
     // timestamps: fast parser vs byte-at-a-time reference
     let mut tfails = 0u64;
     let mut tvalid = 0u64;
+    let mut memo = TsParser::new();
     let junk: &[u8] = b"0123456789-+:TZtz .x\r\"";
     for i in 0..2_000_000u64 {
+        // the second half uses a handful of dates, so the memo mostly hits
+        let narrow = i >= 1_000_000;
         let mut s: Vec<u8> = match i % 3 {
             0 | 1 => {
-                let y = rnd() % 10000;
-                let mo = rnd() % 14;
-                let d = rnd() % 33;
+                let y = if narrow { 2027 + rnd() % 2 } else { rnd() % 10000 };
+                let mo = if narrow { 1 + rnd() % 3 } else { rnd() % 14 };
+                let d = if narrow { 26 + rnd() % 6 } else { rnd() % 33 };
                 let h = rnd() % 26;
                 let mi = rnd() % 61;
                 let se = rnd() % 61;
@@ -1880,11 +1994,12 @@ fn id_selftest() {
             s[k] = junk[(rnd() % junk.len() as u64) as usize];
         }
         let (a, b) = (parse_ts(&s), parse_ts_ref(&s));
+        let m = memo.parse(&s);
         tvalid += a.is_some() as u64;
-        if a != b {
+        if a != b || m != b {
             tfails += 1;
             if tfails <= 5 {
-                eprintln!("  ts mismatch {:?}: fast {a:?} ref {b:?}", String::from_utf8_lossy(&s));
+                eprintln!("  ts mismatch {:?}: fast {a:?} memo {m:?} ref {b:?}", String::from_utf8_lossy(&s));
             }
         }
     }
