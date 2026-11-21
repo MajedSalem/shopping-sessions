@@ -46,7 +46,6 @@ impl Hasher for IdHasher {
     }
 }
 type BH = BuildHasherDefault<IdHasher>;
-type U64Map<V> = HashMap<u64, V, BH>;
 
 macro_rules! log {
     ($t0:expr, $($arg:tt)*) => {
@@ -318,40 +317,130 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(&whole).expect("manifest ts") + ms
 }
 
+// ---------------------------------------------------------------- exact IDs
+
+/// An ID string packed exactly into 128 bits: up to 15 bytes big-endian in the high
+/// bytes, the length in the low byte. Comparing two packed IDs (hi, then lo) is the
+/// byte-wise comparison of the strings. Longer strings get a 120-bit hash with 0xFF as
+/// the low byte and are kept in a side table; comparisons involving them use the bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+struct Id {
+    hi: u64,
+    lo: u64,
+}
+
+impl std::hash::Hash for Id {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(mix(*self));
+    }
+}
+
+#[inline]
+fn mix(a: Id) -> u64 {
+    let mut h = a.hi ^ a.lo.rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= h >> 32;
+    h
+}
+
+static LONG_IDS: std::sync::OnceLock<Mutex<HashMap<Id, S>>> = std::sync::OnceLock::new();
+
+#[inline]
+fn enc(s: S) -> Id {
+    let n = s.len();
+    if n <= 15 {
+        let mut b = [0u8; 16];
+        b[..n].copy_from_slice(s);
+        b[15] = n as u8;
+        Id { hi: u64::from_be_bytes(b[..8].try_into().unwrap()), lo: u64::from_be_bytes(b[8..].try_into().unwrap()) }
+    } else {
+        enc_long(s)
+    }
+}
+
+#[cold]
+fn enc_long(s: S) -> Id {
+    let h = xxh3_128(s);
+    let id = Id { hi: (h >> 64) as u64, lo: (h as u64) | 0xFF };
+    LONG_IDS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(id).or_insert(s);
+    id
+}
+
+#[inline]
+fn is_long(a: Id) -> bool {
+    a.lo & 0xFF == 0xFF
+}
+
+struct IdStr {
+    b: [u8; 16],
+    n: usize,
+    long: Option<S>,
+}
+impl IdStr {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self.long {
+            Some(s) => s,
+            None => &self.b[..self.n],
+        }
+    }
+}
+
+#[inline]
+fn decode(a: Id) -> IdStr {
+    if is_long(a) {
+        let s = *LONG_IDS.get().unwrap().lock().unwrap().get(&a).unwrap();
+        return IdStr { b: [0; 16], n: 0, long: Some(s) };
+    }
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&a.hi.to_be_bytes());
+    b[8..].copy_from_slice(&a.lo.to_be_bytes());
+    IdStr { b, n: (a.lo & 0xFF) as usize, long: None }
+}
+
+/// Byte-wise order of the original strings.
+#[inline]
+fn id_cmp(a: Id, b: Id) -> std::cmp::Ordering {
+    if !is_long(a) && !is_long(b) {
+        a.cmp(&b)
+    } else {
+        decode(a).bytes().cmp(decode(b).bytes())
+    }
+}
+
 // ---------------------------------------------------------------- records
 
 /// One parsed copy of an event. `ts == INVALID` marks an invalid (or late) copy.
 #[derive(Clone, Copy)]
 struct EvRaw {
-    e0: u64,
-    e1: u64,
-    uh: u64,     // hash of user_id
-    user: u64,   // packed slice
+    eid: Id,
+    user: Id,
     ingest: u32, // seconds since epoch
     ts: u32,     // ms since window_start
     pc: u32,     // price | cat << 24 (price 0 for non-purchases)
 }
 const INVALID: u32 = u32::MAX;
 
-/// A surviving event. `key` is the user-id hash until resolved, then the person key.
+/// A surviving event. `key` is the user id until resolved, then the person (their name).
 #[derive(Clone, Copy)]
 struct SessEv {
-    key: u64,
-    user: u64,
+    key: Id,
     ts: u32,
     pc: u32,
 }
 
 #[derive(Clone, Copy)]
 struct ClickRec {
-    key: u64,
-    cid: u64, // packed slice
-    ts: u32,  // ms since window_start - 7 days
+    key: Id,
+    cid: Id,
+    ts: u32, // ms since window_start - 7 days
     camp: u16,
 }
 
 struct URow {
-    name: S,
+    name: Id,
     day: i32,
     sessions: u32,
     events: u32,
@@ -367,19 +456,9 @@ struct CAcc {
     assisted: u64,
 }
 
-const PTR_MASK: u64 = (1u64 << 48) - 1;
 #[inline]
-fn pack(s: S) -> u64 {
-    ((s.len().min(65535) as u64) << 48) | (s.as_ptr() as u64 & PTR_MASK)
-}
-#[inline]
-fn unpack(v: u64) -> S {
-    unsafe { std::slice::from_raw_parts((v & PTR_MASK) as *const u8, (v >> 48) as usize) }
-}
-
-#[inline]
-fn bucket(h: u64) -> usize {
-    (h >> 56) as usize
+fn bucket(a: Id) -> usize {
+    (mix(a) >> 56) as usize
 }
 
 type Parts<T> = Vec<Vec<T>>; // NB partitions
@@ -403,8 +482,8 @@ fn transpose<T>(v: Vec<Parts<T>>) -> Vec<Vec<Vec<T>>> {
 
 // ---------------------------------------------------------------- links
 
-/// Per bucket of id hash: id hash -> (person key = hash of the person's name, own id slice packed).
-type LinkMap = HashMap<u64, (u64, u64), BH>;
+/// Per bucket of id: id -> the person's name (their smallest id).
+type LinkMap = HashMap<Id, Id, BH>;
 
 fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
     loop {
@@ -440,41 +519,40 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 
 fn build_links(files: Vec<S>) -> Vec<LinkMap> {
     let ch = chunks(&files, CHUNK);
-    // parse: edges per chunk, ids per chunk partitioned by bucket
-    let parsed: Vec<(Vec<(u64, u64)>, Parts<(u64, u64)>)> = ch
+    let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = ch
         .par_iter()
         .map(|&c| {
             let mut edges = vec![];
-            let mut ids: Parts<(u64, u64)> = new_parts(0);
+            let mut ids: Parts<Id> = new_parts(0);
             for_lines(c, |l| {
                 let mut f: [S; 2] = [&[]; 2];
-                if split(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() && f[0].len() < 65536 && f[1].len() < 65536 {
-                    let ha = xxh3_64(f[0]);
-                    let hb = xxh3_64(f[1]);
-                    if ha != hb {
-                        edges.push((ha, hb));
+                if split(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+                    let a = enc(f[0]);
+                    let b = enc(f[1]);
+                    if a != b {
+                        edges.push((a, b));
                     }
-                    ids[bucket(ha)].push((ha, pack(f[0])));
-                    ids[bucket(hb)].push((hb, pack(f[1])));
+                    ids[bucket(a)].push(a);
+                    ids[bucket(b)].push(b);
                 }
             });
             (edges, ids)
         })
         .collect();
-    let (edges, idparts): (Vec<Vec<(u64, u64)>>, Vec<Parts<(u64, u64)>>) = parsed.into_iter().unzip();
+    let (edges, idparts): (Vec<Vec<(Id, Id)>>, Vec<Parts<Id>>) = parsed.into_iter().unzip();
     let idparts = transpose(idparts);
-    // per bucket: unique ids with local index
-    let mut maps: Vec<(LinkMap, Vec<u64>)> = idparts
+    // per bucket: unique ids; the map value temporarily holds the local index in `lo`
+    let mut maps: Vec<(LinkMap, Vec<Id>)> = idparts
         .into_par_iter()
         .map(|parts| {
             let n: usize = parts.iter().map(|p| p.len()).sum();
             let mut m: LinkMap = HashMap::with_capacity_and_hasher(n, BH::default());
-            let mut list: Vec<u64> = Vec::with_capacity(n);
+            let mut list: Vec<Id> = Vec::with_capacity(n);
             for p in parts {
-                for (h, s) in p {
-                    m.entry(h).or_insert_with(|| {
-                        list.push(h);
-                        ((list.len() - 1) as u64, s)
+                for a in p {
+                    m.entry(a).or_insert_with(|| {
+                        list.push(a);
+                        Id { hi: 0, lo: (list.len() - 1) as u64 }
                     });
                 }
             }
@@ -486,30 +564,24 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
         off[b + 1] = off[b] + maps[b].1.len() as u32;
     }
     let n = off[NB] as usize;
-    let gidx = |h: u64| -> u32 { off[bucket(h)] + maps[bucket(h)].0[&h].0 as u32 };
+    let gidx = |a: Id| -> u32 {
+        let b = bucket(a);
+        off[b] + maps[b].0[&a].lo as u32
+    };
     let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     edges.par_iter().for_each(|es| {
-        for &(ha, hb) in es {
-            uf_union(&parent, gidx(ha), gidx(hb));
+        for &(a, b) in es {
+            uf_union(&parent, gidx(a), gidx(b));
         }
     });
-    // global tables: hash and slice of every id
-    let mut ghash = vec![0u64; n];
-    let mut gstr = vec![0u64; n];
-    for b in 0..NB {
-        let o = off[b] as usize;
-        for (h, &(li, s)) in maps[b].0.iter() {
-            ghash[o + li as usize] = *h;
-            gstr[o + li as usize] = s;
-        }
-    }
+    let gid: Vec<Id> = maps.iter().flat_map(|(_, l)| l.iter().copied()).collect();
     // smallest id per component
     let best: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     (0..n as u32).into_par_iter().for_each(|i| {
         let r = uf_find(&parent, i) as usize;
-        let mine = unpack(gstr[i as usize]);
+        let mine = gid[i as usize];
         let mut cur = best[r].load(Relaxed);
-        while mine < unpack(gstr[cur as usize]) {
+        while id_cmp(mine, gid[cur as usize]).is_lt() {
             match best[r].compare_exchange_weak(cur, i, AcqRel, Relaxed) {
                 Ok(_) => break,
                 Err(c) => cur = c,
@@ -519,19 +591,18 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
     maps.par_iter_mut().enumerate().for_each(|(b, (m, _))| {
         let o = off[b];
         for v in m.values_mut() {
-            let g = o + v.0 as u32;
-            let r = uf_find(&parent, g) as usize;
-            v.0 = ghash[best[r].load(Relaxed) as usize];
+            let r = uf_find(&parent, o + v.lo as u32) as usize;
+            *v = gid[best[r].load(Relaxed) as usize];
         }
     });
     maps.into_iter().map(|(m, _)| m).collect()
 }
 
 #[inline]
-fn resolve(maps: &[LinkMap], b: usize, uh: u64) -> u64 {
-    match maps[b].get(&uh) {
-        Some(v) => v.0,
-        None => uh,
+fn resolve(maps: &[LinkMap], b: usize, u: Id) -> Id {
+    match maps[b].get(&u) {
+        Some(v) => *v,
+        None => u,
     }
 }
 
@@ -544,6 +615,7 @@ fn main() {
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let threads = if ncpu > 0 { ncpu } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) };
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
+    LONG_IDS.get_or_init(|| Mutex::new(HashMap::new()));
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
@@ -561,24 +633,24 @@ fn main() {
     cats.dedup();
     assert!(cats.len() <= 256, "too many categories");
     let unknown = cats.binary_search(&(&b"unknown"[..])).unwrap() as u8;
-    let mut prod_map: U64Map<u8> = HashMap::with_capacity_and_hasher(prods.len() * 2, BH::default());
+    let mut prod_map: HashMap<Id, u8, BH> = HashMap::with_capacity_and_hasher(prods.len() * 2, BH::default());
     for p in &prods {
         if !p[0].is_empty() {
-            prod_map.entry(xxh3_64(p[0])).or_insert(cats.binary_search(&p[1]).unwrap() as u8);
+            prod_map.entry(enc(p[0])).or_insert(cats.binary_search(&p[1]).unwrap() as u8);
         }
     }
     let ncat = cats.len();
     // campaigns
     let camps_raw = read_small(&data.join("campaigns.csv"));
-    let mut camp_map: U64Map<u16> = HashMap::with_capacity_and_hasher(camps_raw.len() * 2, BH::default());
+    let mut camp_map: HashMap<Id, u16, BH> = HashMap::with_capacity_and_hasher(camps_raw.len() * 2, BH::default());
     let mut camps: Vec<[S; 2]> = vec![];
     for c in &camps_raw {
         if c[0].is_empty() {
             continue;
         }
-        let h = xxh3_64(c[0]);
-        if !camp_map.contains_key(&h) {
-            camp_map.insert(h, camps.len() as u16);
+        let k = enc(c[0]);
+        if !camp_map.contains_key(&k) {
+            camp_map.insert(k, camps.len() as u16);
             camps.push(*c);
         }
     }
@@ -613,17 +685,16 @@ fn main() {
         },
     );
 
-    // ---- stage 2: dedup events on event_id (smallest ingest), keep valid ones, by user-hash bucket
+    // ---- stage 2: dedup events on event_id (smallest ingest), keep valid ones, by user bucket
     let stage2: Vec<Parts<SessEv>> = stage1
         .into_par_iter()
         .map(|parts| {
             let total: usize = parts.iter().map(|p| p.len()).sum();
-            let mut map: HashMap<u128, u64, BH> = HashMap::with_capacity_and_hasher(total, BH::default());
+            let mut map: HashMap<Id, u64, BH> = HashMap::with_capacity_and_hasher(total, BH::default());
             for (pi, p) in parts.iter().enumerate() {
                 for (i, r) in p.iter().enumerate() {
-                    let key = ((r.e1 as u128) << 64) | r.e0 as u128;
                     let v = ((pi as u64) << 32) | i as u64;
-                    match map.entry(key) {
+                    match map.entry(r.eid) {
                         hashbrown::hash_map::Entry::Occupied(mut o) => {
                             let cur = *o.get();
                             let c = &parts[(cur >> 32) as usize][(cur & 0xffff_ffff) as usize];
@@ -644,7 +715,7 @@ fn main() {
                 if r.ts == INVALID {
                     continue;
                 }
-                out[bucket(r.uh)].push(SessEv { key: r.uh, user: r.user, ts: r.ts, pc: r.pc });
+                out[bucket(r.user)].push(SessEv { key: r.user, ts: r.ts, pc: r.pc });
             }
             out
         })
@@ -652,7 +723,7 @@ fn main() {
     let stage2 = transpose(stage2);
     log!(t0, "events deduped");
 
-    // ---- resolve user hash -> person key, re-bucket by person
+    // ---- resolve user id -> person, re-bucket by person
     let resolved: Vec<(Parts<SessEv>, Parts<ClickRec>)> = stage2
         .into_par_iter()
         .zip(clicks1.into_par_iter())
@@ -688,8 +759,7 @@ fn main() {
     let user_rows: Vec<Vec<URow>> = ev_r
         .into_par_iter()
         .zip(ck_r.into_par_iter())
-        .enumerate()
-        .map(|(b, (eparts, cparts))| {
+        .map(|(eparts, cparts)| {
             let mut evs: Vec<SessEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
             for p in eparts {
                 evs.extend_from_slice(&p);
@@ -699,10 +769,9 @@ fn main() {
                 cls.extend_from_slice(&p);
             }
             evs.sort_unstable_by_key(|e| (e.key, e.ts));
-            cls.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+            cls.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| id_cmp(a.cid, b.cid)));
             let tid = rayon::current_thread_index().unwrap_or(0);
             let mut acc = accs[tid].lock().unwrap();
-            let lm = &links[b];
             let mut rows: Vec<URow> = Vec::new();
             let mut counts = vec![0u32; ncamp];
             let mut active: Vec<u16> = Vec::new();
@@ -727,10 +796,7 @@ fn main() {
                     ci += 1;
                 }
                 let pc = &cls[c0..ci];
-                let name = match lm.get(&pk) {
-                    Some(v) => unpack(v.1),
-                    None => unpack(evs[i].user),
-                };
+                let name = pk;
                 let pe = &evs[i..j];
                 let (mut lo, mut hi) = (0usize, 0usize);
                 let mut cur_day: i64 = i64::MIN;
@@ -836,7 +902,7 @@ fn main() {
     log!(t0, "done");
 }
 
-fn parse_events(c: S, ws: i64, we: i64, prod_map: &U64Map<u8>, unknown: u8) -> Parts<EvRaw> {
+fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH>, unknown: u8) -> Parts<EvRaw> {
     let lines = memchr_iter(b'\n', c).count() + 1;
     let mut parts: Parts<EvRaw> = new_parts(lines / NB + lines / NB / 4 + 16);
     for_lines(c, |l| {
@@ -848,14 +914,12 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &U64Map<u8>, unknown: u8) -> P
         if eid.is_empty() {
             return;
         }
-        let h = xxh3_128(eid);
-        let e0 = h as u64;
-        let e1 = (h >> 64) as u64;
+        let eid = enc(eid);
         let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
-        let mut r = EvRaw { e0, e1, uh: 0, user: 0, ingest, ts: INVALID, pc: 0 };
+        let mut r = EvRaw { eid, user: Id::default(), ingest, ts: INVALID, pc: 0 };
         'v: {
-            if f[1].is_empty() || f[5].is_empty() || f[1].len() > 65535 {
+            if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
             let ts = match parse_ts(f[2]) {
@@ -866,7 +930,7 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &U64Map<u8>, unknown: u8) -> P
                 b"view" | b"cart" => {}
                 b"purchase" => match parse_price(f[6]) {
                     Some(p) => {
-                        let cat = *prod_map.get(&xxh3_64(f[5])).unwrap_or(&unknown) as u32;
+                        let cat = *prod_map.get(&enc(f[5])).unwrap_or(&unknown) as u32;
                         r.pc = p | (cat << 24);
                     }
                     None => break 'v,
@@ -877,15 +941,14 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &U64Map<u8>, unknown: u8) -> P
                 break 'v;
             }
             r.ts = (ts - ws) as u32;
-            r.uh = xxh3_64(f[1]);
-            r.user = pack(f[1]);
+            r.user = enc(f[1]);
         }
-        parts[bucket(e1)].push(r);
+        parts[bucket(eid)].push(r);
     });
     parts
 }
 
-fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &U64Map<u16>) -> Parts<ClickRec> {
+fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &HashMap<Id, u16, BH>) -> Parts<ClickRec> {
     let lines = memchr_iter(b'\n', c).count() + 1;
     let mut parts: Parts<ClickRec> = new_parts(lines / NB + lines / NB / 4 + 16);
     for_lines(c, |l| {
@@ -893,19 +956,19 @@ fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &U64Map<u16>) -> Parts<ClickR
         if !split(l, &mut f) {
             return;
         }
-        if f[0].is_empty() || f[1].is_empty() || f[0].len() > 65535 {
+        if f[0].is_empty() || f[1].is_empty() {
             return;
         }
         let ts = match parse_ts(f[3]) {
             Some(t) if t >= cws && t < we => t,
             _ => return,
         };
-        let camp = match camp_map.get(&xxh3_64(f[2])) {
+        let camp = match camp_map.get(&enc(f[2])) {
             Some(&c) => c,
             None => return,
         };
-        let uh = xxh3_64(f[1]);
-        parts[bucket(uh)].push(ClickRec { key: uh, cid: pack(f[0]), ts: (ts - cws) as u32, camp });
+        let u = enc(f[1]);
+        parts[bucket(u)].push(ClickRec { key: u, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
     });
     parts
 }
@@ -967,7 +1030,7 @@ fn write_outputs(out: &Path, user_rows: Vec<Vec<URow>>, total: &[CAcc], camps: &
         let mut b_t = StringBuilder::with_capacity(n, n * 8);
         for rows in g.iter() {
             for r in rows {
-                b_user.append_value(utf8(r.name));
+                b_user.append_value(utf8(decode(r.name).bytes()));
                 b_day.append_value(r.day);
                 b_s.append_value(r.sessions as i64);
                 b_e.append_value(r.events as i64);

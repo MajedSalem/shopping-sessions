@@ -2,3 +2,4 @@ target/
 dev/
 data*/
 out*/
+OPTIMIZATION_LOG.md
