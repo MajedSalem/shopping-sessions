@@ -15,6 +15,9 @@ parquet = { version = "53", default-features = false, features = ["arrow", "snap
 arrow-array = "53"
 arrow-schema = "53"
 
+[features]
+prof = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

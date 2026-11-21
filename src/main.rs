@@ -2,8 +2,8 @@
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -22,7 +22,6 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const NB: usize = 256; // partitions
-const CHUNK: usize = 4 << 20;
 
 #[derive(Default, Clone, Copy)]
 struct IdHasher(u64);
@@ -54,6 +53,39 @@ macro_rules! log {
     ($t0:expr, $($arg:tt)*) => {
         eprintln!("[{:>7.3}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
     };
+}
+
+// ---------------------------------------------------------------- profiling (feature "prof")
+
+const PROF: bool = cfg!(feature = "prof");
+/// read, scan overhead, eid+ingest, validation, user+push, closure calls (lines)
+static PROF_CY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+const PROF_NAMES: [&str; 6] = ["pread", "scanner", "eid+ingest", "validate", "user+store", "lines"];
+
+#[inline(always)]
+fn tsc() -> u64 {
+    if PROF {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    } else {
+        0
+    }
+}
+
+fn prof_add(i: usize, v: u64) {
+    if PROF {
+        PROF_CY[i].fetch_add(v, Relaxed);
+    }
+}
+
+fn prof_report() {
+    if PROF {
+        let v: Vec<u64> = PROF_CY.iter().map(|a| a.load(Relaxed)).collect();
+        let lines = v[5].max(1);
+        for i in 0..5 {
+            eprintln!("prof {:<11} {:>8.1} Gcycles  {:>6.1} cycles/line", PROF_NAMES[i], v[i] as f64 / 1e9, v[i] as f64 / lines as f64);
+        }
+        eprintln!("prof lines {}", v[5]);
+    }
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -555,9 +587,18 @@ fn piece_size() -> usize {
 /// and calls `f` on the complete lines that *start* in each piece (the header line of each
 /// file excluded). A piece reads 1 byte before it (to see whether a line starts at its first
 /// byte) and up to the end of its last line, growing the read for very long lines.
-fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> Vec<T> {
+fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(usize, &[u8]) -> T + Sync) -> Vec<T> {
+    for_each_piece_sized(files, piece_size(), f)
+}
+
+/// Each file adds at most one partial piece; reserve room for that in the piece count.
+fn files_slack(files: &[FileRef]) -> usize {
+    files.len().min((1 << 13) - 1)
+}
+
+/// `for_each_piece` with an explicit piece size.
+fn for_each_piece_sized<T: Send>(files: &[FileRef], piece: usize, f: impl Fn(usize, &[u8]) -> T + Sync) -> Vec<T> {
     use std::os::unix::fs::FileExt;
-    let piece = piece_size();
     let slack = SLACK.min(piece);
     let tasks: Vec<(usize, usize)> = files
         .iter()
@@ -566,7 +607,8 @@ fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> 
         .collect();
     tasks
         .par_iter()
-        .map_init(Vec::<u8>::new, |buf, &(fi, off)| {
+        .enumerate()
+        .map_init(Vec::<u8>::new, |buf, (ti, &(fi, off))| {
             let fr = &files[fi];
             let rs = off.saturating_sub(1); // read start
             let piece_end = (off + piece).min(fr.len); // first byte of the next piece
@@ -575,17 +617,19 @@ fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> 
                 if buf.len() < want {
                     buf.resize(want, 0);
                 }
+                let tr = tsc();
                 fr.file.read_exact_at(&mut buf[..want], rs as u64).expect("read");
+                prof_add(0, tsc().wrapping_sub(tr));
                 let b = &buf[..want];
                 // first line starting in [off, piece_end): after the header for off == 0,
                 // else after the first newline at or after byte off - 1
                 let start = match memchr(b'\n', b) {
                     Some(i) => i + 1,
-                    None => return f(&[]),
+                    None => return f(ti, &[]),
                 };
                 let pe = piece_end - rs; // piece end in buffer coordinates
                 if start >= pe {
-                    return f(&[]);
+                    return f(ti, &[]);
                 }
                 // end of the last line starting before pe: the first newline at or after pe - 1
                 let end = if pe >= want && rs + want == fr.len {
@@ -600,7 +644,7 @@ fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> 
                         }
                     }
                 };
-                return f(&b[start..end]);
+                return f(ti, &b[start..end]);
             }
         })
         .collect()
@@ -737,6 +781,7 @@ fn enc(s: &[u8]) -> Id {
 #[cold]
 fn enc_fallback(s: &[u8]) -> Id {
     let code = FALLBACK | (xxh3_64(s) >> 1);
+    let code = if code == u64::MAX { code - 1 } else { code };
     // input buffers are reused, so the table keeps its own copy of the string
     fallback_table()[(code % SHARDS as u64) as usize]
         .lock()
@@ -829,21 +874,6 @@ struct EvRaw {
 }
 const INVALID: u32 = u32::MAX;
 
-/// A surviving event. `key` is the user id until resolved, then the person (their name).
-#[derive(Clone, Copy)]
-struct SessEv {
-    key: Id,
-    ts: u32,
-    pc: u32,
-}
-
-#[derive(Clone, Copy)]
-struct ClickRec {
-    key: Id,
-    cid: Id,
-    ts: u32, // ms since window_start - 7 days
-    camp: u16,
-}
 
 struct URow {
     name: Id,
@@ -931,7 +961,7 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 }
 
 fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
-    let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = for_each_piece(&files, |c| {
+    let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = for_each_piece(&files, |_, c| {
             let mut edges = vec![];
             let mut ids: Parts<Id> = new_parts(0);
             scan::<2>(c, |f| {
@@ -1006,12 +1036,311 @@ fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
     maps.into_iter().map(|(m, _)| m).collect()
 }
 
-#[inline]
-fn resolve(maps: &[LinkMap], b: usize, u: Id) -> Id {
-    match maps[b].get(&u) {
-        Some(v) => *v,
-        None => u,
+
+// ---------------------------------------------------------------- global tables (iteration 8)
+
+/// Open-addressing hash table of (key, value) u64 pairs with linear probing, lock-free.
+/// Keys are stored as `id + 1` so that 0 means empty (zeroed memory = empty table, so
+/// allocation costs only lazy zero pages). Callers never use u64::MAX as an id.
+struct Table {
+    slots: Vec<u64>,
+    mask: usize,
+}
+
+const MAX_PROBES: usize = 1 << 16;
+
+impl Table {
+    fn new(entries: usize) -> Table {
+        let n = (entries + entries / 2).next_power_of_two().max(1 << 16);
+        Table { slots: vec![0u64; 2 * n], mask: n - 1 }
     }
+    #[inline(always)]
+    fn a(&self) -> &[AtomicU64] {
+        // SAFETY: AtomicU64 has the same layout as u64; all access goes through atomics.
+        unsafe { &*(self.slots.as_slice() as *const [u64] as *const [AtomicU64]) }
+    }
+    #[inline(always)]
+    fn home(&self, id: Id) -> usize {
+        (mix(id) as usize) & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, id: Id) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.slots.as_ptr().add(2 * self.home(id)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    /// Dedup: keep the minimum of `v` per id (stored as !v with fetch_max, as 0 = empty).
+    #[inline]
+    fn insert_min(&self, id: Id, v: u64) {
+        let (a, key) = (self.a(), id.0 + 1);
+        let mut i = self.home(id);
+        for _ in 0..MAX_PROBES {
+            let k = a[2 * i].load(Relaxed);
+            if k == key {
+                a[2 * i + 1].fetch_max(!v, Relaxed);
+                return;
+            }
+            if k == 0 {
+                match a[2 * i].compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        a[2 * i + 1].fetch_max(!v, Relaxed);
+                        return;
+                    }
+                    Err(x) if x == key => {
+                        a[2 * i + 1].fetch_max(!v, Relaxed);
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+        panic!("dedup table full");
+    }
+    /// The minimum value stored for an id that is known to be present.
+    #[inline]
+    fn get_min(&self, id: Id) -> u64 {
+        let (a, key) = (self.a(), id.0 + 1);
+        let mut i = self.home(id);
+        loop {
+            let k = a[2 * i].load(Relaxed);
+            if k == key {
+                return !a[2 * i + 1].load(Relaxed);
+            }
+            debug_assert!(k != 0);
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// Users: dense person index of an id, inserting a new person (named by the id itself)
+    /// if the id is not in the table. Values are stored as index + 1 (0 = being written).
+    #[inline]
+    fn person(&self, id: Id, next: &AtomicU32, names: &[AtomicU64]) -> u32 {
+        let (a, key) = (self.a(), id.0 + 1);
+        let mut i = self.home(id);
+        for _ in 0..MAX_PROBES {
+            let k = a[2 * i].load(Acquire);
+            if k == 0 {
+                match a[2 * i].compare_exchange(0, key, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let idx = next.fetch_add(1, Relaxed);
+                        names[idx as usize].store(id.0, Relaxed);
+                        a[2 * i + 1].store(idx as u64 + 1, Release);
+                        return idx;
+                    }
+                    Err(x) if x != key => {
+                        i = (i + 1) & self.mask;
+                        continue;
+                    }
+                    Err(_) => {} // same key inserted concurrently: wait for its value below
+                }
+            } else if k != key {
+                i = (i + 1) & self.mask;
+                continue;
+            }
+            loop {
+                let v = a[2 * i + 1].load(Acquire);
+                if v != 0 {
+                    return (v - 1) as u32;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        panic!("user table full");
+    }
+    /// Users: insert a linked id with a given person index (before any lookups).
+    fn put(&self, id: Id, idx: u32) {
+        let (a, key) = (self.a(), id.0 + 1);
+        let mut i = self.home(id);
+        for _ in 0..MAX_PROBES {
+            let k = a[2 * i].load(Relaxed);
+            if k == key {
+                return;
+            }
+            if k == 0 && a[2 * i].compare_exchange(0, key, Relaxed, Relaxed).is_ok() {
+                a[2 * i + 1].store(idx as u64 + 1, Relaxed);
+                return;
+            }
+            if a[2 * i].load(Relaxed) == key {
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+        panic!("user table full");
+    }
+    /// Users: person index of an id, or None if the id never had a valid event copy.
+    #[inline]
+    fn get(&self, id: Id) -> Option<u32> {
+        let (a, key) = (self.a(), id.0 + 1);
+        let mut i = self.home(id);
+        loop {
+            let k = a[2 * i].load(Relaxed);
+            if k == key {
+                return Some((a[2 * i + 1].load(Relaxed) - 1) as u32);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// A valid event copy in its person's bucket. It survives dedup iff the dedup table's
+/// minimum for `eid` is (its ingest_ts, its copy number), i.e. `win`.
+#[derive(Clone, Copy)]
+struct PEv {
+    pidx: u32,
+    ts: u32,
+    pc: u32,
+    copy: u32,
+    eid: Id,
+}
+
+#[derive(Clone, Copy)]
+struct PClick {
+    pidx: u32,
+    ts: u32,
+    cid: Id,
+    camp: u16,
+}
+
+#[derive(Clone, Copy)]
+struct TmpEv {
+    eid: Id,
+    user: Id,
+    v: u64, // ingest_ts << 32 | copy
+    ts: u32,
+    pc: u32,
+    valid: bool,
+}
+
+const LOOKAHEAD: usize = 16;
+
+struct Globals<'a> {
+    dedup: &'a Table,
+    users: &'a Table,
+    next: &'a AtomicU32,
+    names: &'a [AtomicU64],
+}
+
+#[inline]
+fn person_bucket(pidx: u32) -> usize {
+    pidx as usize & (NB - 1)
+}
+
+/// Events: decode the piece into `tmp`, then do the table work with prefetching:
+/// every copy goes into the dedup table; valid copies get their person and are stored.
+fn parse_events_g(piece: usize, c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, g: &Globals) -> Parts<PEv> {
+    thread_local! {
+        static TMP: std::cell::RefCell<Vec<TmpEv>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    TMP.with(|cell| {
+        let mut tmp = cell.borrow_mut();
+        tmp.clear();
+        let mut k: u32 = 0;
+        let pbase = (piece as u32) << 18;
+        scan::<7>(c, |f| {
+            if f[0].is_empty() {
+                return;
+            }
+            let eid = enc(f[0]);
+            let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
+            let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u64;
+            let copy = pbase | k;
+            k += 1;
+            let mut r = TmpEv { eid, user: Id::default(), v: (ingest << 32) | copy as u64, ts: 0, pc: 0, valid: false };
+            'v: {
+                if f[1].is_empty() || f[5].is_empty() {
+                    break 'v;
+                }
+                let ts = match parse_ts(f[2]) {
+                    Some(t) if t >= ws && t < we => t,
+                    _ => break 'v,
+                };
+                match f[4] {
+                    b"view" | b"cart" => {}
+                    b"purchase" => match parse_price(f[6]) {
+                        Some(p) => {
+                            let cat = *prod_map.get(&key128(f[5])).unwrap_or(&unknown) as u32;
+                            r.pc = p | (cat << 24);
+                        }
+                        None => break 'v,
+                    },
+                    _ => break 'v,
+                }
+                if ingest_ms - ts > DAY {
+                    break 'v;
+                }
+                r.ts = (ts - ws) as u32;
+                r.user = enc(f[1]);
+                r.valid = true;
+            }
+            tmp.push(r);
+        });
+        assert!(k < (1 << 18), "too many lines in one piece");
+        let n = tmp.len();
+        let mut parts: Parts<PEv> = new_parts(part_cap(n));
+        for j in 0..n.min(LOOKAHEAD) {
+            g.dedup.prefetch(tmp[j].eid);
+            if tmp[j].valid {
+                g.users.prefetch(tmp[j].user);
+            }
+        }
+        for j in 0..n {
+            if j + LOOKAHEAD < n {
+                let t = &tmp[j + LOOKAHEAD];
+                g.dedup.prefetch(t.eid);
+                if t.valid {
+                    g.users.prefetch(t.user);
+                }
+            }
+            let r = tmp[j];
+            g.dedup.insert_min(r.eid, r.v);
+            if r.valid {
+                let pidx = g.users.person(r.user, g.next, g.names);
+                parts[person_bucket(pidx)].push(PEv { pidx, ts: r.ts, pc: r.pc, copy: r.v as u32, eid: r.eid });
+            }
+        }
+        parts
+    })
+}
+
+/// Clicks: decode, then look up each user's person (clicks of users that never had a valid
+/// event copy are irrelevant and dropped).
+fn parse_clicks_g(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, g: &Globals) -> Parts<PClick> {
+    let mut tmp: Vec<(Id, PClick)> = Vec::with_capacity(c.len() / 45 + 1);
+    scan::<4>(c, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        let ts = match parse_ts(f[3]) {
+            Some(t) if t >= cws && t < we => t,
+            _ => return,
+        };
+        let camp = match camp_map.get(&key128(f[2])) {
+            Some(&c) => c,
+            None => return,
+        };
+        tmp.push((enc(f[1]), PClick { pidx: 0, ts: (ts - cws) as u32, cid: enc(f[0]), camp }));
+    });
+    let n = tmp.len();
+    let mut parts: Parts<PClick> = new_parts(part_cap(n));
+    for j in 0..n.min(LOOKAHEAD) {
+        g.users.prefetch(tmp[j].0);
+    }
+    for j in 0..n {
+        if j + LOOKAHEAD < n {
+            g.users.prefetch(tmp[j + LOOKAHEAD].0);
+        }
+        let (u, mut ck) = tmp[j];
+        if let Some(pidx) = g.users.get(u) {
+            ck.pidx = pidx;
+            parts[person_bucket(pidx)].push(ck);
+        }
+    }
+    parts
 }
 
 // ---------------------------------------------------------------- main
@@ -1078,187 +1407,144 @@ fn main() {
     let ncamp = camps.len();
     assert!(ncamp < 65535);
     let organic = ncamp;
+    if std::env::var_os("BENCH").is_some() {
+        parser_bench(&data, ws, we, &prod_map, unknown);
+        unsafe { libc::_exit(0) };
+    }
 
     let (ev_files, ck_files, ln_files) = (open_csvs(&data.join("events")), open_csvs(&data.join("clicks")), open_csvs(&data.join("links")));
     log!(t0, "setup: {} event files, {} click files, {} link files, ndays {ndays}", ev_files.len(), ck_files.len(), ln_files.len());
+    let ev_bytes: usize = ev_files.iter().map(|f| f.len).sum();
 
-    // ---- stage 1: links || (events, clicks) parsing
-    let parse_all = || {
-        let s1: Vec<Parts<EvRaw>> = for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown));
-        log!(t0, "events parsed");
-        let c1: Vec<Parts<ClickRec>> = for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map));
-        log!(t0, "clicks parsed");
-        (transpose(s1), transpose(c1))
-    };
-    // SEQ=1 (diagnostics only): build links first, then parse, to time each on its own.
-    let (links, (stage1, clicks1)) = if std::env::var_os("SEQ").is_some() {
-        let l = build_links(ln_files);
-        log!(t0, "links built");
-        (l, parse_all())
-    } else {
-        rayon::join(
-            || {
-                let l = build_links(ln_files);
-                log!(t0, "links built");
-                l
-            },
-            parse_all,
-        )
-    };
-
-    // ---- stage 2: dedup events on event_id (smallest ingest), keep valid ones, by user bucket
-    let stage2: Vec<Parts<SessEv>> = stage1
-        .into_par_iter()
-        .map(|parts| {
-            let total: usize = parts.iter().map(|p| p.len()).sum();
-            // global index of a record within this bucket = base[part] + index in part
-            let mut base = Vec::with_capacity(parts.len());
-            let mut acc = 0usize;
-            for p in &parts {
-                base.push(acc);
-                acc += p.len();
-            }
-            // The map finds the losing copies (a later ingest_ts, or an equal one, whose
-            // copies are identical); they are marked dead. Survivors are then read in order.
-            let mut map: HashMap<Id, u64, BH> = HashMap::with_capacity_and_hasher(total, BH::default());
-            let mut dead = vec![0u64; total.div_ceil(64)];
-            let kill = |dead: &mut Vec<u64>, g: usize| dead[g >> 6] |= 1u64 << (g & 63);
-            for (pi, p) in parts.iter().enumerate() {
-                for (i, r) in p.iter().enumerate() {
-                    let g = base[pi] + i;
-                    match map.entry(r.eid) {
-                        hashbrown::hash_map::Entry::Occupied(mut o) => {
-                            let cur = *o.get();
-                            let (cp, ci) = ((cur >> 32) as usize, (cur & 0xffff_ffff) as usize);
-                            if r.ingest < parts[cp][ci].ingest {
-                                kill(&mut dead, base[cp] + ci);
-                                *o.get_mut() = ((pi as u64) << 32) | i as u64;
-                            } else {
-                                kill(&mut dead, g);
-                            }
-                        }
-                        hashbrown::hash_map::Entry::Vacant(e) => {
-                            e.insert(((pi as u64) << 32) | i as u64);
-                        }
-                    }
-                }
-            }
-            drop(map);
-            let cap = total / NB + total / NB / 4 + 16;
-            let mut out: Parts<SessEv> = new_parts(cap);
-            for (pi, p) in parts.iter().enumerate() {
-                let b0 = base[pi];
-                for (i, r) in p.iter().enumerate() {
-                    let g = b0 + i;
-                    if r.ts == INVALID || (dead[g >> 6] >> (g & 63)) & 1 != 0 {
-                        continue;
-                    }
-                    out[bucket(r.user)].push(SessEv { key: r.user, ts: r.ts, pc: r.pc });
-                }
-            }
-            out
-        })
-        .collect();
-    let stage2 = transpose(stage2);
-    log!(t0, "events deduped");
-
-    // ---- resolve user id -> person, re-bucket by person
-    let resolved: Vec<(Parts<SessEv>, Parts<ClickRec>)> = stage2
-        .into_par_iter()
-        .zip(clicks1.into_par_iter())
+    // ---- links first: every linked id gets its person's dense index
+    let links = build_links(ln_files);
+    let counts: Vec<usize> = links.par_iter().map(|m| m.iter().filter(|(k, v)| k == v).count()).collect();
+    let mut off = vec![0u32; NB + 1];
+    for b in 0..NB {
+        off[b + 1] = off[b] + counts[b] as u32;
+    }
+    let ncomp = off[NB];
+    let name_idx: Vec<HashMap<Id, u32, BH>> = links
+        .par_iter()
         .enumerate()
-        .map(|(b, (eparts, cparts))| {
-            let ne: usize = eparts.iter().map(|p| p.len()).sum();
-            let nc: usize = cparts.iter().map(|p| p.len()).sum();
-            let mut eo: Parts<SessEv> = new_parts(ne / NB + ne / NB / 4 + 16);
-            let mut co: Parts<ClickRec> = new_parts(nc / NB + nc / NB / 4 + 16);
-            for p in eparts {
-                for mut e in p {
-                    e.key = resolve(&links, b, e.key);
-                    eo[bucket(e.key)].push(e);
+        .map(|(b, m)| {
+            let mut h: HashMap<Id, u32, BH> = HashMap::with_capacity_and_hasher(counts[b], BH::default());
+            let mut r = off[b];
+            for (k, v) in m.iter() {
+                if k == v {
+                    h.insert(*k, r);
+                    r += 1;
                 }
             }
-            for p in cparts {
-                for mut c in p {
-                    c.key = resolve(&links, b, c.key);
-                    co[bucket(c.key)].push(c);
-                }
-            }
-            (eo, co)
+            h
         })
         .collect();
-    let (ev_r, ck_r): (Vec<Parts<SessEv>>, Vec<Parts<ClickRec>>) = resolved.into_iter().unzip();
-    let ev_r = transpose(ev_r);
-    let ck_r = transpose(ck_r);
-    log!(t0, "persons resolved");
+    let nlinked: usize = links.iter().map(|m| m.len()).sum();
+    // sizes: copies ~ bytes/80 (table for bytes/56 keys); distinct users ~ events/15 (sized for bytes/400)
+    let dedup = Table::new(ev_bytes / 56 + 1024);
+    let users = Table::new(nlinked + ev_bytes / 400 + 1024);
+    let names_store = vec![0u64; users.mask + 1 + ncomp as usize];
+    // SAFETY: same layout; all access through atomics
+    let names: &[AtomicU64] = unsafe { &*(names_store.as_slice() as *const [u64] as *const [AtomicU64]) };
+    links.par_iter().for_each(|m| {
+        for (id, name) in m.iter() {
+            let idx = name_idx[bucket(*name)][name];
+            users.put(*id, idx);
+            if id == name {
+                names[idx as usize].store(name.0, Relaxed);
+            }
+        }
+    });
+    drop(name_idx);
+    drop(links);
+    let next = AtomicU32::new(ncomp);
+    let g = Globals { dedup: &dedup, users: &users, next: &next, names };
+    log!(t0, "links built: {nlinked} linked ids, {ncomp} linked persons");
 
-    // ---- stage 3: sessions per person
+    // ---- events: dedup table + person resolution + store into person buckets, one pass
+    // copy number = piece index (14 bits) << 18 | line in piece: keep the piece count under
+    // 2^14 by growing pieces for very large inputs (a valid line is >= 8 bytes, so a piece of
+    // up to 2 MB has < 2^18 lines; inputs up to ~32 GB fit).
+    let ev_piece = piece_size().max(ev_bytes.div_ceil((1 << 14) - files_slack(&ev_files)) + 1);
+    let ev_parts: Vec<Parts<PEv>> = for_each_piece_sized(&ev_files, ev_piece, |piece, c| parse_events_g(piece, c, ws, we, &prod_map, unknown, &g));
+    assert!(ev_parts.len() < (1 << 14), "too many event pieces");
+    log!(t0, "events parsed");
+    let ck_parts: Vec<Parts<PClick>> = for_each_piece(&ck_files, |_, c| parse_clicks_g(c, cws, we, &camp_map, &g));
+    log!(t0, "clicks parsed");
+    let ev_b = transpose(ev_parts);
+    let ck_b = transpose(ck_parts);
+
+    // ---- sessions per person bucket
     let nthreads = rayon::current_num_threads();
     let accs: Vec<Mutex<Vec<CAcc>>> = (0..nthreads).map(|_| Mutex::new(vec![CAcc::default(); (ncamp + 1) * ndays])).collect();
-    let user_rows: Vec<Vec<URow>> = ev_r
+    let user_rows: Vec<Vec<URow>> = ev_b
         .into_par_iter()
-        .zip(ck_r.into_par_iter())
-        .map(|(eparts, cparts)| {
-            let mut evs: Vec<SessEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
+        .zip(ck_b.into_par_iter())
+        .enumerate()
+        .map(|(b, (eparts, cparts))| {
+            let mut evs: Vec<PEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
             for p in eparts {
                 evs.extend_from_slice(&p);
             }
-            let mut cls: Vec<ClickRec> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
-            for p in cparts {
-                cls.extend_from_slice(&p);
+            // dedup: keep the copy holding the table's minimum (ingest_ts, copy number)
+            let n = evs.len();
+            let mut w = 0usize;
+            for j in 0..n.min(LOOKAHEAD) {
+                dedup.prefetch(evs[j].eid);
             }
-            // Group by person without comparing 128-bit keys: dense index per person,
-            // counting sort into person order, then sort each person's short list by ts.
-            let mut pidx: HashMap<Id, u32, BH> = HashMap::with_capacity_and_hasher(evs.len() / 4 + 16, BH::default());
-            let mut persons: Vec<Id> = Vec::new();
-            let eix: Vec<u32> = evs
-                .iter()
-                .map(|e| {
-                    let n = persons.len() as u32;
-                    *pidx.entry(e.key).or_insert_with(|| {
-                        persons.push(e.key);
-                        n
-                    })
-                })
-                .collect();
-            let np = persons.len();
+            for j in 0..n {
+                if j + LOOKAHEAD < n {
+                    dedup.prefetch(evs[j + LOOKAHEAD].eid);
+                }
+                let e = evs[j];
+                if dedup.get_min(e.eid) as u32 == e.copy {
+                    evs[w] = e;
+                    w += 1;
+                }
+            }
+            evs.truncate(w);
+            // dense local person index li = pidx >> 8 (pidx & 255 == b): counting sort, no hashing
+            let np = evs.iter().map(|e| (e.pidx >> 8) as usize + 1).max().unwrap_or(0);
             let mut eoff = vec![0u32; np + 1];
-            for &x in &eix {
-                eoff[x as usize + 1] += 1;
+            for e in &evs {
+                eoff[(e.pidx >> 8) as usize + 1] += 1;
             }
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
-            let mut sorted: Vec<SessEv> = evs.clone();
+            let mut sorted: Vec<PEv> = evs.clone();
             {
                 let mut cur = eoff.clone();
-                for (e, &x) in evs.iter().zip(&eix) {
-                    sorted[cur[x as usize] as usize] = *e;
-                    cur[x as usize] += 1;
+                for e in &evs {
+                    let li = (e.pidx >> 8) as usize;
+                    sorted[cur[li] as usize] = *e;
+                    cur[li] += 1;
                 }
             }
             drop(evs);
-            drop(eix);
-            // clicks of persons without events are irrelevant
-            let cix: Vec<u32> = cls.iter().map(|c| pidx.get(&c.key).copied().unwrap_or(u32::MAX)).collect();
-            let mut coff = vec![0u32; np + 1];
-            for &x in &cix {
-                if x != u32::MAX {
-                    coff[x as usize + 1] += 1;
+            let mut cls: Vec<PClick> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
+            for p in cparts {
+                for c in p {
+                    let li = (c.pidx >> 8) as usize;
+                    if li < np && eoff[li + 1] > eoff[li] {
+                        cls.push(c);
+                    }
                 }
+            }
+            let mut coff = vec![0u32; np + 1];
+            for c in &cls {
+                coff[(c.pidx >> 8) as usize + 1] += 1;
             }
             for p in 0..np {
                 coff[p + 1] += coff[p];
             }
-            let mut csorted: Vec<ClickRec> = Vec::with_capacity(coff[np] as usize);
-            unsafe { csorted.set_len(coff[np] as usize) };
+            let mut csorted: Vec<PClick> = cls.clone();
             {
                 let mut cur = coff.clone();
-                for (c, &x) in cls.iter().zip(&cix) {
-                    if x != u32::MAX {
-                        csorted[cur[x as usize] as usize] = *c;
-                        cur[x as usize] += 1;
-                    }
+                for c in &cls {
+                    let li = (c.pidx >> 8) as usize;
+                    csorted[cur[li] as usize] = *c;
+                    cur[li] += 1;
                 }
             }
             drop(cls);
@@ -1272,6 +1558,9 @@ fn main() {
             // Click times are relative to ws - WEEK, session times to ws.
             let wk = WEEK as u32;
             for p in 0..np {
+                if eoff[p + 1] == eoff[p] {
+                    continue;
+                }
                 let pe = &mut sorted[eoff[p] as usize..eoff[p + 1] as usize];
                 if pe.len() > 1 {
                     pe.sort_unstable_by_key(|e| e.ts);
@@ -1282,7 +1571,7 @@ fn main() {
                     pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| id_cmp(a.cid, b.cid)));
                 }
                 let pc = &*pc;
-                let name = persons[p];
+                let name = Id(names[((p as u32) << 8 | b as u32) as usize].load(Relaxed));
                 let (mut lo, mut hi) = (0usize, 0usize);
                 let mut cur_day: i64 = i64::MIN;
                 let mut row = URow { name, day: 0, sessions: 0, events: 0, revenue: 0, top: None };
@@ -1384,6 +1673,7 @@ fn main() {
 
     write_outputs(&out, user_rows, &total, &camps, ncamp, ndays, day0, &cats);
     log!(t0, "done");
+    prof_report();
     // Output files are complete (closed by the writers). Skip destructors and exit handlers:
     // mimalloc's exit-time cleanup of the retained memory occasionally stalled ~1.4 s.
     unsafe { libc::_exit(0) };
@@ -1392,7 +1682,10 @@ fn main() {
 fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) -> Parts<EvRaw> {
     let lines = c.len() / 70 + 1; // estimate: event lines are ~80 bytes
     let mut parts: Parts<EvRaw> = new_parts(part_cap(lines));
+    let t_all = tsc();
+    let mut cy = [0u64; 4]; // eid+ingest, validate, user+store, lines
     scan::<7>(c, |f| {
+        let ta = tsc();
         let eid = f[0];
         if eid.is_empty() {
             return;
@@ -1401,6 +1694,8 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
         let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut r = EvRaw { eid, user: Id::default(), ingest, ts: INVALID, pc: 0 };
+        let tb = tsc();
+        let mut tc = 0u64;
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -1424,33 +1719,32 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
                 break 'v;
             }
             r.ts = (ts - ws) as u32;
+            tc = tsc();
             r.user = enc(f[1]);
         }
+        if tc == 0 {
+            tc = tsc();
+        }
         parts[bucket(eid)].push(r);
+        if PROF {
+            let td = tsc();
+            cy[0] += tb - ta;
+            cy[1] += tc - tb;
+            cy[2] += td - tc;
+            cy[3] += 1;
+        }
     });
+    if PROF {
+        let total = tsc() - t_all;
+        prof_add(1, total - cy[0] - cy[1] - cy[2]);
+        prof_add(2, cy[0]);
+        prof_add(3, cy[1]);
+        prof_add(4, cy[2]);
+        prof_add(5, cy[3]);
+    }
     parts
 }
 
-fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>) -> Parts<ClickRec> {
-    let lines = c.len() / 45 + 1; // estimate: click lines are ~50 bytes
-    let mut parts: Parts<ClickRec> = new_parts(part_cap(lines));
-    scan::<4>(c, |f| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
-        }
-        let ts = match parse_ts(f[3]) {
-            Some(t) if t >= cws && t < we => t,
-            _ => return,
-        };
-        let camp = match camp_map.get(&key128(f[2])) {
-            Some(&c) => c,
-            None => return,
-        };
-        let u = enc(f[1]);
-        parts[bucket(u)].push(ClickRec { key: u, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
-    });
-    parts
-}
 
 #[inline]
 fn top_cat(catrev: &mut [u64], revenue: u64) -> Option<u8> {
@@ -1693,3 +1987,93 @@ fn id_selftest() {
     let fails = fails + tfails as usize;
     std::process::exit(if fails == 0 { 0 } else { 1 });
 }
+
+// ---------------------------------------------------------------- parser bench (BENCH=1)
+
+/// Loads up to BENCH_MB (default 200) of event data and times parser layers on ONE thread,
+/// best of 5.
+fn parser_bench(data: &Path, ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) {
+    use std::hint::black_box;
+    let limit: usize = std::env::var("BENCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(200) << 20;
+    let mut bufs: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0;
+    for p in list_csv(&data.join("events")) {
+        if total >= limit {
+            break;
+        }
+        let b = std::fs::read(&p).unwrap();
+        total += b.len();
+        bufs.push(b);
+    }
+    // 1 MB pieces at line boundaries, header removed (like the real reader)
+    let mut pieces: Vec<&[u8]> = Vec::new();
+    for b in &bufs {
+        let mut start = match memchr(b'\n', b) {
+            Some(i) => i + 1,
+            None => continue,
+        };
+        while start < b.len() {
+            let mut end = (start + PIECE).min(b.len());
+            if end < b.len() {
+                end = memchr(b'\n', &b[end..]).map(|i| end + i + 1).unwrap_or(b.len());
+            }
+            pieces.push(&b[start..end]);
+            start = end;
+        }
+    }
+    let lines: usize = pieces.iter().map(|p| memchr_iter(b'\n', p).count()).sum();
+    eprintln!("bench: {} MB, {} pieces, {} lines (1 thread, best of 5)", total >> 20, pieces.len(), lines);
+    let time = |name: &str, f: &dyn Fn(&[u8]) -> u64| {
+        let mut best = f64::MAX;
+        let mut chk = 0u64;
+        for _ in 0..5 {
+            let t = Instant::now();
+            chk = 0;
+            for p in &pieces {
+                chk = chk.wrapping_add(f(p));
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("  {:<34} {:>7.1} ns/line   {:>6.0} MB/s   ({chk})", name, best * 1e9 / lines as f64, total as f64 / best / 1e6);
+    };
+    time("L0 newlines (memchr)", &|p| memchr_iter(b'\n', p).count() as u64);
+    time("L1 block masks", &|p| {
+        let mut acc = 0u64;
+        let mut i = 0;
+        while i + 64 <= p.len() {
+            let (c, n, q) = masks64(p[i..i + 64].try_into().unwrap());
+            acc += (c ^ n ^ q).count_ones() as u64;
+            i += 64;
+        }
+        acc
+    });
+    time("L2 scan, empty callback", &|p| {
+        let mut n = 0u64;
+        scan::<7>(p, |_| n += 1);
+        n
+    });
+    time("L3a scan + 2 enc", &|p| {
+        let mut acc = 0u64;
+        scan::<7>(p, |f| acc = acc.wrapping_add(enc(f[0]).0 ^ enc(f[1]).0));
+        acc
+    });
+    time("L3b scan + 2 parse_ts", &|p| {
+        let mut acc = 0u64;
+        scan::<7>(p, |f| acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
+        acc
+    });
+    time("L3 scan + 2 enc + 2 parse_ts", &|p| {
+        let mut acc = 0u64;
+        scan::<7>(p, |f| {
+            acc = acc.wrapping_add(enc(f[0]).0 ^ enc(f[1]).0);
+            acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64);
+        });
+        acc
+    });
+    time("L4 parse_events (full, stores)", &|p| {
+        let parts = parse_events(p, ws, we, prod_map, unknown);
+        black_box(parts.iter().map(|v| v.len() as u64).sum())
+    });
+}
+
+
