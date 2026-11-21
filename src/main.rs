@@ -147,8 +147,8 @@ fn parse_iso(b: &[u8]) -> Option<i64> {
     Some(secs * 1000)
 }
 
-#[inline]
-fn parse_ts(b: &[u8]) -> Option<i64> {
+/// Reference timestamp parser (byte at a time). Used by the self-test to check `parse_ts`.
+fn parse_ts_ref(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 {
         return None;
@@ -165,6 +165,144 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         v = v.checked_mul(10)?.checked_add(d as i64)?;
     }
     Some(v)
+}
+
+const fn rep8(x: u8) -> u64 {
+    0x0101_0101_0101_0101u64 * x as u64
+}
+
+#[inline(always)]
+fn ld8(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+}
+
+/// True iff every byte selected by `m` (0xFF lanes) of `w` is an ASCII digit.
+/// A byte >= 0xFA can carry into its neighbour, but it already fails its own check.
+#[inline(always)]
+fn digits_ok(w: u64, m: u64) -> bool {
+    let x = w & m;
+    let hi = rep8(0xF0) & m;
+    let three = rep8(0x30) & m;
+    (x & hi) == three && (x.wrapping_add(rep8(0x06) & m) & hi) == three
+}
+
+/// Value of 8 ASCII digits (already validated); the first byte is the most significant.
+#[inline(always)]
+fn swar8(w: u64) -> u64 {
+    let x = w.wrapping_sub(rep8(b'0'));
+    let x = x.wrapping_mul(10).wrapping_add(x >> 8);
+    let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(100).wrapping_add((x >> 16) & 0x00FF_00FF_00FF_00FF);
+    let x = (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(10000).wrapping_add((x >> 32) & 0x0000_FFFF_0000_FFFF);
+    x & 0xFFFF_FFFF
+}
+
+const CUM_DAYS: [i64; 13] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
+
+/// F1 / F2 with word-sized checks. Same rules as `parse_iso`.
+#[inline]
+fn parse_iso_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    // "YYYY-MM-" "DDTHH:MM" ":SS" ; little-endian lanes
+    let w0 = ld8(b, 0);
+    let w1 = ld8(b, 8);
+    let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64;
+    const MD0: u64 = 0x00FF_FF00_FFFF_FFFF; // digits at 0-3, 5, 6
+    const MS0: u64 = 0xFF00_00FF_0000_0000; // '-' at 4 and 7
+    const T0: u64 = ((b'-' as u64) << 32) | ((b'-' as u64) << 56);
+    const MD1: u64 = 0xFFFF_00FF_FF00_FFFF; // digits at 8, 9, 11, 12, 14, 15
+    const MS1: u64 = 0x0000_FF00_00FF_0000; // 'T' at 10, ':' at 13
+    const T1: u64 = ((b'T' as u64) << 16) | ((b':' as u64) << 40);
+    const MD2: u64 = 0x00FF_FF00; // digits at 17, 18
+    let ok = (w0 & MS0) == T0
+        && (w1 & MS1) == T1
+        && (w2 & 0xFF) == b':' as u64
+        && digits_ok(w0, MD0)
+        && digits_ok(w1, MD1)
+        && digits_ok(w2, MD2);
+    if !ok {
+        return None;
+    }
+    // separators -> '0' so the subtraction cannot borrow across bytes
+    let v0 = ((w0 & MD0) | (rep8(b'0') & !MD0)).wrapping_sub(rep8(b'0'));
+    let v1 = ((w1 & MD1) | (rep8(b'0') & !MD1)).wrapping_sub(rep8(b'0'));
+    let v2 = ((w2 & MD2) | (0x3030_3030 & !MD2)).wrapping_sub(0x3030_3030);
+    let by = |w: u64, k: u32| ((w >> (8 * k)) & 0xFF) as i64;
+    let y = by(v0, 0) * 1000 + by(v0, 1) * 100 + by(v0, 2) * 10 + by(v0, 3);
+    let mo = by(v0, 5) * 10 + by(v0, 6);
+    let d = by(v1, 0) * 10 + by(v1, 1);
+    let h = by(v1, 3) * 10 + by(v1, 4);
+    let mi = by(v1, 6) * 10 + by(v1, 7);
+    let s = by(v2, 1) * 10 + by(v2, 2);
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+        return None;
+    }
+    let leap = is_leap(y);
+    let dim = match mo {
+        2 => 28 + leap as i64,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    let off = if n == 20 {
+        if b[19] != b'Z' {
+            return None;
+        }
+        0
+    } else {
+        let sign = match b[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if b[22] != b':' {
+            return None;
+        }
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 60 + om)
+    };
+    let days = if (1970..=2099).contains(&y) {
+        // leap years in 1970..2099 are exactly the multiples of 4
+        (y - 1970) * 365 + (y - 1969) / 4 + CUM_DAYS[(mo - 1) as usize] + (mo > 2 && leap) as i64 + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    };
+    Some((days * 86400 + h * 3600 + mi * 60 + s - off * 60) * 1000)
+}
+
+#[inline]
+fn parse_ts(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 0 {
+        return None;
+    }
+    if (n == 20 || n == 25) && b[4] == b'-' {
+        return parse_iso_fast(b);
+    }
+    if (8..=18).contains(&n) {
+        // F3 that cannot overflow: last 8 digits by SWAR, the rest in a short loop
+        let w = ld8(b, n - 8);
+        if !digits_ok(w, !0) {
+            return None;
+        }
+        let mut hi: i64 = 0;
+        let mut bad = false;
+        for &c in &b[..n - 8] {
+            let d = c.wrapping_sub(b'0');
+            bad |= d > 9;
+            hi = hi * 10 + d as i64;
+        }
+        if bad {
+            return None;
+        }
+        return Some(hi * 100_000_000 + swar8(w) as i64);
+    }
+    parse_ts_ref(b)
 }
 
 #[inline]
@@ -274,7 +412,10 @@ fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
         let _ = ls;
         let mut out: [&'a [u8]; N] = [&[]; N];
         for i in 0..N {
-            out[i] = &data[starts[i]..ends[i]];
+            debug_assert!(starts[i] <= ends[i] && ends[i] <= data.len());
+            // SAFETY: starts[i] is one past a separator and ends[i] the next separator (or
+            // the end of data), both found inside `data` in increasing order.
+            out[i] = unsafe { data.get_unchecked(starts[i]..ends[i]) };
         }
         if q != 0 {
             let mut good = 0u32;
@@ -942,52 +1083,78 @@ fn main() {
     log!(t0, "setup: {} event files, {} click files, {} link files, ndays {ndays}", ev_files.len(), ck_files.len(), ln_files.len());
 
     // ---- stage 1: links || (events, clicks) parsing
-    let (links, (stage1, clicks1)) = rayon::join(
-        || {
-            let l = build_links(ln_files);
-            log!(t0, "links built");
-            l
-        },
-        || {
-            let s1: Vec<Parts<EvRaw>> = for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown));
-            log!(t0, "events parsed");
-            let c1: Vec<Parts<ClickRec>> = for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map));
-            log!(t0, "clicks parsed");
-            (transpose(s1), transpose(c1))
-        },
-    );
+    let parse_all = || {
+        let s1: Vec<Parts<EvRaw>> = for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown));
+        log!(t0, "events parsed");
+        let c1: Vec<Parts<ClickRec>> = for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map));
+        log!(t0, "clicks parsed");
+        (transpose(s1), transpose(c1))
+    };
+    // SEQ=1 (diagnostics only): build links first, then parse, to time each on its own.
+    let (links, (stage1, clicks1)) = if std::env::var_os("SEQ").is_some() {
+        let l = build_links(ln_files);
+        log!(t0, "links built");
+        (l, parse_all())
+    } else {
+        rayon::join(
+            || {
+                let l = build_links(ln_files);
+                log!(t0, "links built");
+                l
+            },
+            parse_all,
+        )
+    };
 
     // ---- stage 2: dedup events on event_id (smallest ingest), keep valid ones, by user bucket
     let stage2: Vec<Parts<SessEv>> = stage1
         .into_par_iter()
         .map(|parts| {
             let total: usize = parts.iter().map(|p| p.len()).sum();
+            // global index of a record within this bucket = base[part] + index in part
+            let mut base = Vec::with_capacity(parts.len());
+            let mut acc = 0usize;
+            for p in &parts {
+                base.push(acc);
+                acc += p.len();
+            }
+            // The map finds the losing copies (a later ingest_ts, or an equal one, whose
+            // copies are identical); they are marked dead. Survivors are then read in order.
             let mut map: HashMap<Id, u64, BH> = HashMap::with_capacity_and_hasher(total, BH::default());
+            let mut dead = vec![0u64; total.div_ceil(64)];
+            let kill = |dead: &mut Vec<u64>, g: usize| dead[g >> 6] |= 1u64 << (g & 63);
             for (pi, p) in parts.iter().enumerate() {
                 for (i, r) in p.iter().enumerate() {
-                    let v = ((pi as u64) << 32) | i as u64;
+                    let g = base[pi] + i;
                     match map.entry(r.eid) {
                         hashbrown::hash_map::Entry::Occupied(mut o) => {
                             let cur = *o.get();
-                            let c = &parts[(cur >> 32) as usize][(cur & 0xffff_ffff) as usize];
-                            if r.ingest < c.ingest {
-                                *o.get_mut() = v;
+                            let (cp, ci) = ((cur >> 32) as usize, (cur & 0xffff_ffff) as usize);
+                            if r.ingest < parts[cp][ci].ingest {
+                                kill(&mut dead, base[cp] + ci);
+                                *o.get_mut() = ((pi as u64) << 32) | i as u64;
+                            } else {
+                                kill(&mut dead, g);
                             }
                         }
                         hashbrown::hash_map::Entry::Vacant(e) => {
-                            e.insert(v);
+                            e.insert(((pi as u64) << 32) | i as u64);
                         }
                     }
                 }
             }
+            drop(map);
             let cap = total / NB + total / NB / 4 + 16;
             let mut out: Parts<SessEv> = new_parts(cap);
-            for &v in map.values() {
-                let r = &parts[(v >> 32) as usize][(v & 0xffff_ffff) as usize];
-                if r.ts == INVALID {
-                    continue;
+            for (pi, p) in parts.iter().enumerate() {
+                let b0 = base[pi];
+                for (i, r) in p.iter().enumerate() {
+                    let g = b0 + i;
+                    if r.ts == INVALID || (dead[g >> 6] >> (g & 63)) & 1 != 0 {
+                        continue;
+                    }
+                    out[bucket(r.user)].push(SessEv { key: r.user, ts: r.ts, pc: r.pc });
                 }
-                out[bucket(r.user)].push(SessEv { key: r.user, ts: r.ts, pc: r.pc });
             }
             out
         })
@@ -1476,5 +1643,53 @@ fn id_selftest() {
     }
     let canon = ids.iter().filter(|i| !is_long(**i)).count();
     eprintln!("id selftest: {n} strings ({canon} canonical), failures: {fails}");
+    // timestamps: fast parser vs byte-at-a-time reference
+    let mut tfails = 0u64;
+    let mut tvalid = 0u64;
+    let junk: &[u8] = b"0123456789-+:TZtz .x\r\"";
+    for i in 0..2_000_000u64 {
+        let mut s: Vec<u8> = match i % 3 {
+            0 | 1 => {
+                let y = rnd() % 10000;
+                let mo = rnd() % 14;
+                let d = rnd() % 33;
+                let h = rnd() % 26;
+                let mi = rnd() % 61;
+                let se = rnd() % 61;
+                let mut t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}");
+                if i % 3 == 0 {
+                    t.push('Z');
+                } else {
+                    let sign = if rnd() % 2 == 0 { '+' } else { '-' };
+                    t.push_str(&format!("{sign}{:02}:{:02}", rnd() % 26, rnd() % 62));
+                }
+                t.into_bytes()
+            }
+            _ => {
+                let len = 1 + (rnd() % 25) as usize;
+                let zeros = (rnd() % 4) as usize;
+                let mut t: Vec<u8> = vec![b'0'; zeros.min(len)];
+                while t.len() < len {
+                    t.push(b'0' + (rnd() % 10) as u8);
+                }
+                t
+            }
+        };
+        // corrupt one byte in a quarter of the cases
+        if rnd() % 4 == 0 && !s.is_empty() {
+            let k = (rnd() % s.len() as u64) as usize;
+            s[k] = junk[(rnd() % junk.len() as u64) as usize];
+        }
+        let (a, b) = (parse_ts(&s), parse_ts_ref(&s));
+        tvalid += a.is_some() as u64;
+        if a != b {
+            tfails += 1;
+            if tfails <= 5 {
+                eprintln!("  ts mismatch {:?}: fast {a:?} ref {b:?}", String::from_utf8_lossy(&s));
+            }
+        }
+    }
+    eprintln!("ts selftest: 2000000 strings ({tvalid} valid), failures: {tfails}");
+    let fails = fails + tfails as usize;
     std::process::exit(if fails == 0 { 0 } else { 1 });
 }
