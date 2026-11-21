@@ -665,6 +665,58 @@ fn piece_size() -> usize {
 /// file excluded). A piece reads 1 byte before it (to see whether a line starts at its first
 /// byte) and up to the end of its last line, growing the read for very long lines.
 fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> Vec<T> {
+    if std::env::var_os("READ_PREAD").is_none() {
+        return for_each_piece_mapped(files, f);
+    }
+    for_each_piece_pread(files, f)
+}
+
+/// Like `for_each_piece_pread`, but straight from a private read-only mapping of each file: no
+/// copy into a buffer. Nothing is pre-loaded; a page-cache page is mapped when the piece that
+/// holds it is parsed (file faults map neighbouring cached pages too, 16 at a time by default).
+fn for_each_piece_mapped<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> Vec<T> {
+    use std::os::unix::io::AsRawFd;
+    let piece = piece_size();
+    let maps: Vec<&[u8]> = files
+        .iter()
+        .map(|fr| unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), fr.len, libc::PROT_READ, libc::MAP_PRIVATE, fr.file.as_raw_fd(), 0);
+            assert!(p != libc::MAP_FAILED, "mmap failed");
+            std::slice::from_raw_parts(p as *const u8, fr.len)
+        })
+        .collect();
+    let tasks: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, fr)| (0..fr.len.div_ceil(piece)).map(move |k| (fi, k * piece)))
+        .collect();
+    tasks
+        .par_iter()
+        .map(|&(fi, off)| {
+            let d = maps[fi];
+            let len = d.len();
+            let piece_end = (off + piece).min(len);
+            // first line starting in [off, piece_end): after the header for off == 0, else after
+            // the first newline at or after byte off - 1
+            let rs = off.saturating_sub(1);
+            let start = match memchr(b'\n', &d[rs..]) {
+                Some(i) => rs + i + 1,
+                None => return f(&[]),
+            };
+            if start >= piece_end {
+                return f(&[]);
+            }
+            // end of the last line starting before piece_end
+            let end = match memchr(b'\n', &d[piece_end - 1..]) {
+                Some(i) => piece_end - 1 + i + 1,
+                None => len,
+            };
+            f(&d[start..end])
+        })
+        .collect()
+}
+
+fn for_each_piece_pread<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> Vec<T> {
     use std::os::unix::fs::FileExt;
     let piece = piece_size();
     let slack = SLACK.min(piece);
