@@ -11,4 +11,5 @@ RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/sessions /app/sessions
 USER 1000:1000
 WORKDIR /app
+ENV MIMALLOC_PURGE_DELAY=-1
 CMD ["/app/sessions"]

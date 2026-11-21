@@ -263,7 +263,7 @@ fn bit_range(a: u32, b: u32) -> u64 {
 /// of every well-formed line. Quote rule by counting: a line is valid iff its quote count
 /// equals 2 x the number of fields that start and end with '"' (length >= 2).
 #[inline]
-fn scan<const N: usize>(data: S, mut f: impl FnMut(&[S; N])) {
+fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = data.len();
     let mut starts = [0usize; N];
     let mut ends = [0usize; N];
@@ -272,7 +272,7 @@ fn scan<const N: usize>(data: S, mut f: impl FnMut(&[S; N])) {
     let mut q = 0u32; // quotes in this line
     let mut emit = |ls: usize, starts: &[usize; N], ends: &[usize; N], q: u32| {
         let _ = ls;
-        let mut out: [S; N] = [&[]; N];
+        let mut out: [&'a [u8]; N] = [&[]; N];
         for i in 0..N {
             out[i] = &data[starts[i]..ends[i]];
         }
@@ -381,6 +381,88 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     };
     v.sort();
     v
+}
+
+/// An input CSV opened for positional reads.
+struct FileRef {
+    file: File,
+    len: usize,
+}
+
+fn open_csvs(dir: &Path) -> Vec<FileRef> {
+    list_csv(dir)
+        .into_iter()
+        .map(|p| {
+            let file = File::open(&p).unwrap_or_else(|e| panic!("open {p:?}: {e}"));
+            let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            FileRef { file, len }
+        })
+        .filter(|f| f.len > 0)
+        .collect()
+}
+
+const PIECE: usize = 1 << 20;
+const SLACK: usize = 16 << 10;
+
+/// Piece size; PIECE_BYTES overrides it for boundary tests only.
+fn piece_size() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("PIECE_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(PIECE))
+}
+
+/// Reads every file in pieces of PIECE bytes, in parallel, into a reused per-thread buffer,
+/// and calls `f` on the complete lines that *start* in each piece (the header line of each
+/// file excluded). A piece reads 1 byte before it (to see whether a line starts at its first
+/// byte) and up to the end of its last line, growing the read for very long lines.
+fn for_each_piece<T: Send>(files: &[FileRef], f: impl Fn(&[u8]) -> T + Sync) -> Vec<T> {
+    use std::os::unix::fs::FileExt;
+    let piece = piece_size();
+    let slack = SLACK.min(piece);
+    let tasks: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, fr)| (0..fr.len.div_ceil(piece)).map(move |k| (fi, k * piece)))
+        .collect();
+    tasks
+        .par_iter()
+        .map_init(Vec::<u8>::new, |buf, &(fi, off)| {
+            let fr = &files[fi];
+            let rs = off.saturating_sub(1); // read start
+            let piece_end = (off + piece).min(fr.len); // first byte of the next piece
+            let mut want = (piece_end + slack).min(fr.len) - rs;
+            loop {
+                if buf.len() < want {
+                    buf.resize(want, 0);
+                }
+                fr.file.read_exact_at(&mut buf[..want], rs as u64).expect("read");
+                let b = &buf[..want];
+                // first line starting in [off, piece_end): after the header for off == 0,
+                // else after the first newline at or after byte off - 1
+                let start = match memchr(b'\n', b) {
+                    Some(i) => i + 1,
+                    None => return f(&[]),
+                };
+                let pe = piece_end - rs; // piece end in buffer coordinates
+                if start >= pe {
+                    return f(&[]);
+                }
+                // end of the last line starting before pe: the first newline at or after pe - 1
+                let end = if pe >= want && rs + want == fr.len {
+                    want
+                } else {
+                    match memchr(b'\n', &b[pe - 1..]) {
+                        Some(i) => pe - 1 + i + 1,
+                        None if rs + want == fr.len => want,
+                        None => {
+                            want = (want * 2).min(fr.len - rs);
+                            continue;
+                        }
+                    }
+                };
+                return f(&b[start..end]);
+            }
+        })
+        .collect()
 }
 
 /// Split files (header removed) into chunks at line boundaries.
@@ -494,7 +576,7 @@ fn fallback_table() -> &'static Vec<Mutex<HashMap<u64, S>>> {
 }
 
 #[inline]
-fn enc(s: S) -> Id {
+fn enc(s: &[u8]) -> Id {
     let n = s.len();
     if (1..=10).contains(&n) {
         let mut v: u64 = 0;
@@ -512,9 +594,14 @@ fn enc(s: S) -> Id {
 }
 
 #[cold]
-fn enc_fallback(s: S) -> Id {
+fn enc_fallback(s: &[u8]) -> Id {
     let code = FALLBACK | (xxh3_64(s) >> 1);
-    fallback_table()[(code % SHARDS as u64) as usize].lock().unwrap().entry(code).or_insert(s);
+    // input buffers are reused, so the table keeps its own copy of the string
+    fallback_table()[(code % SHARDS as u64) as usize]
+        .lock()
+        .unwrap()
+        .entry(code)
+        .or_insert_with(|| &*Box::leak(s.to_vec().into_boxed_slice()));
     Id(code)
 }
 
@@ -641,6 +728,13 @@ fn bucket(a: Id) -> usize {
 
 type Parts<T> = Vec<Vec<T>>; // NB partitions
 
+/// Per-bucket capacity for `lines` records spread over NB buckets (+25% headroom).
+/// No fixed minimum, so many tiny pieces don't reserve memory they never use.
+fn part_cap(lines: usize) -> usize {
+    let avg = lines / NB;
+    avg + avg / 4 + if lines >= NB * 8 { 8 } else { 0 }
+}
+
 fn new_parts<T>(cap: usize) -> Parts<T> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
 }
@@ -695,11 +789,8 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
     }
 }
 
-fn build_links(files: Vec<S>) -> Vec<LinkMap> {
-    let ch = chunks(&files, CHUNK);
-    let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = ch
-        .par_iter()
-        .map(|&c| {
+fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
+    let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = for_each_piece(&files, |c| {
             let mut edges = vec![];
             let mut ids: Parts<Id> = new_parts(0);
             scan::<2>(c, |f| {
@@ -714,8 +805,7 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
                 }
             });
             (edges, ids)
-        })
-        .collect();
+        });
     let (edges, idparts): (Vec<Vec<(Id, Id)>>, Vec<Parts<Id>>) = parsed.into_iter().unzip();
     let idparts = transpose(idparts);
     // per bucket: unique ids; the map value temporarily holds the local index in `lo`
@@ -786,6 +876,16 @@ fn resolve(maps: &[LinkMap], b: usize, u: Id) -> Id {
 // ---------------------------------------------------------------- main
 
 fn main() {
+    // Freed memory is reused by later stages; returning it to the OS only costs time
+    // (mostly at exit). mimalloc reads this at start-up, so set it and re-exec once.
+    // The Dockerfile sets it too, so in the container no re-exec happens.
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        use std::os::unix::process::CommandExt;
+        if let Ok(exe) = std::env::current_exe() {
+            let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("MIMALLOC_PURGE_DELAY", "-1").exec();
+            eprintln!("re-exec failed ({err}); continuing");
+        }
+    }
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -838,18 +938,8 @@ fn main() {
     assert!(ncamp < 65535);
     let organic = ncamp;
 
-    let paths: Vec<(u8, PathBuf)> = [("events", 0u8), ("clicks", 1), ("links", 2)]
-        .iter()
-        .flat_map(|(d, k)| list_csv(&data.join(d)).into_iter().map(move |p| (*k, p)))
-        .collect();
-    let mapped: Vec<(u8, S)> = paths.par_iter().map(|(k, p)| (*k, map_file(p, true))).collect();
-    let pick = |k: u8| -> Vec<S> { mapped.iter().filter(|m| m.0 == k).map(|m| m.1).collect() };
-    let (ev_files, ck_files, ln_files) = (pick(0), pick(1), pick(2));
+    let (ev_files, ck_files, ln_files) = (open_csvs(&data.join("events")), open_csvs(&data.join("clicks")), open_csvs(&data.join("links")));
     log!(t0, "setup: {} event files, {} click files, {} link files, ndays {ndays}", ev_files.len(), ck_files.len(), ln_files.len());
-    if std::env::var("EXP").is_ok() {
-        parse_experiment(&ev_files, ws, we, &prod_map, unknown);
-        return;
-    }
 
     // ---- stage 1: links || (events, clicks) parsing
     let (links, (stage1, clicks1)) = rayon::join(
@@ -859,11 +949,9 @@ fn main() {
             l
         },
         || {
-            let ev_chunks = chunks(&ev_files, CHUNK);
-            let s1: Vec<Parts<EvRaw>> = ev_chunks.par_iter().map(|&c| parse_events(c, ws, we, &prod_map, unknown)).collect();
+            let s1: Vec<Parts<EvRaw>> = for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown));
             log!(t0, "events parsed");
-            let ck_chunks = chunks(&ck_files, CHUNK);
-            let c1: Vec<Parts<ClickRec>> = ck_chunks.par_iter().map(|&c| parse_clicks(c, cws, we, &camp_map)).collect();
+            let c1: Vec<Parts<ClickRec>> = for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map));
             log!(t0, "clicks parsed");
             (transpose(s1), transpose(c1))
         },
@@ -1129,11 +1217,14 @@ fn main() {
 
     write_outputs(&out, user_rows, &total, &camps, ncamp, ndays, day0, &cats);
     log!(t0, "done");
+    // Output files are complete (closed by the writers). Skip destructors and exit handlers:
+    // mimalloc's exit-time cleanup of the retained memory occasionally stalled ~1.4 s.
+    unsafe { libc::_exit(0) };
 }
 
-fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) -> Parts<EvRaw> {
+fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) -> Parts<EvRaw> {
     let lines = c.len() / 70 + 1; // estimate: event lines are ~80 bytes
-    let mut parts: Parts<EvRaw> = new_parts(lines / NB + lines / NB / 4 + 16);
+    let mut parts: Parts<EvRaw> = new_parts(part_cap(lines));
     scan::<7>(c, |f| {
         let eid = f[0];
         if eid.is_empty() {
@@ -1173,9 +1264,9 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknow
     parts
 }
 
-fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>) -> Parts<ClickRec> {
+fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>) -> Parts<ClickRec> {
     let lines = c.len() / 45 + 1; // estimate: click lines are ~50 bytes
-    let mut parts: Parts<ClickRec> = new_parts(lines / NB + lines / NB / 4 + 16);
+    let mut parts: Parts<ClickRec> = new_parts(part_cap(lines));
     scan::<4>(c, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -1339,58 +1430,6 @@ fn write_outputs(out: &Path, user_rows: Vec<Vec<URow>>, total: &[CAcc], camps: &
     let mut w = ArrowWriter::try_new(f, cschema.clone(), Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
-}
-
-/// Temporary: time the event parse in layers (EXP=1).
-fn parse_experiment(files: &[S], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) {
-    use std::hint::black_box;
-    let ch = chunks(files, CHUNK);
-    let mut best = [f64::MAX; 6];
-    for _round in 0..5 {
-        for level in 0..6 {
-            let t = Instant::now();
-            let n: u64 = ch
-                .par_iter()
-                .map(|&c| {
-                    let mut acc = 0u64;
-                    match level {
-                        0 => for_lines(c, |l| acc += l.len() as u64),
-                        1 => scan::<7>(c, |f| acc += f[2].len() as u64),
-                        2 => scan::<7>(c, |f| {
-                            let e = enc(f[0]);
-                            let u = enc(f[1]);
-                            acc ^= e.0 ^ u.0;
-                        }),
-                        3 => scan::<7>(c, |f| {
-                            let a = parse_ts(f[2]).unwrap_or(0);
-                            let b = parse_ts(f[3]).unwrap_or(0);
-                            acc = acc.wrapping_add((a ^ b) as u64);
-                        }),
-                        4 => {
-                            let p = parse_events(c, ws, we, prod_map, unknown);
-                            acc += p.iter().map(|v| v.len() as u64).sum::<u64>();
-                            black_box(&p);
-                        }
-                        _ => {
-                            // full parse but drop each chunk's output immediately (allocation reuse by mimalloc)
-                            let p = parse_events(c, ws, we, prod_map, unknown);
-                            acc += p[0].len() as u64;
-                            drop(p);
-                        }
-                    }
-                    black_box(acc)
-                })
-                .sum();
-            let names = ["lines only", "+ scan (simd)", "scan + 2x enc", "scan + 2x parse_ts", "full parse (kept)", "full parse (dropped)"];
-            best[level] = best[level].min(t.elapsed().as_secs_f64());
-            black_box(n);
-            let _ = names;
-        }
-    }
-    let names = ["lines only", "+ scan (simd)", "scan + 2x enc", "scan + 2x parse_ts", "full parse (kept)", "full parse (dropped)"];
-    for l in 0..6 {
-        eprintln!("best of 5: level {l} {:<22} {:>7.3}s", names[l], best[l]);
-    }
 }
 
 /// Self-test of the ID encoding (SELFTEST=1): round trip and order on random strings.
