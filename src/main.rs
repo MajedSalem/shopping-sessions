@@ -34,9 +34,11 @@ impl Hasher for IdHasher {
     fn write(&mut self, bytes: &[u8]) {
         self.0 = xxh3_64(bytes);
     }
+    // Keys are already xxh3 hashes, but partitions group keys by their top 8 bits, and
+    // hashbrown takes its 7-bit tag from the top bits: rotate so tags stay distinct.
     #[inline]
     fn write_u64(&mut self, v: u64) {
-        self.0 = v;
+        self.0 = v.rotate_right(8);
     }
     #[inline]
     fn write_u128(&mut self, v: u128) {
@@ -246,51 +248,6 @@ fn map_file(p: &Path, populate: bool) -> S {
     &m[..]
 }
 
-/// Read every file into one huge-page-backed anonymous buffer, in parallel pieces.
-fn read_files(paths: &[PathBuf]) -> Vec<S> {
-    use std::os::unix::fs::FileExt;
-    let files: Vec<(File, usize)> = paths
-        .iter()
-        .map(|p| {
-            let f = File::open(p).unwrap_or_else(|e| panic!("open {p:?}: {e}"));
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
-            (f, len)
-        })
-        .collect();
-    let total: usize = files.iter().map(|f| f.1).sum();
-    if total == 0 {
-        return files.iter().map(|_| &[][..]).collect();
-    }
-    let mut buf = memmap2::MmapOptions::new().len(total).map_anon().expect("anon map");
-    let _ = buf.advise(memmap2::Advice::HugePage);
-    let base = buf.as_mut_ptr() as usize;
-    const PIECE: usize = 8 << 20;
-    let mut tasks = vec![];
-    let mut off = 0usize;
-    for (fi, (_, len)) in files.iter().enumerate() {
-        let mut o = 0;
-        while o < *len {
-            let n = PIECE.min(len - o);
-            tasks.push((fi, o, off + o, n));
-            o += n;
-        }
-        off += len;
-    }
-    tasks.par_iter().for_each(|&(fi, fo, bo, n)| {
-        let dst = unsafe { std::slice::from_raw_parts_mut((base + bo) as *mut u8, n) };
-        files[fi].0.read_exact_at(dst, fo as u64).expect("read");
-    });
-    let buf: &'static memmap2::MmapMut = Box::leak(Box::new(buf));
-    let all: S = &buf[..];
-    let mut out = vec![];
-    let mut off = 0;
-    for (_, len) in &files {
-        out.push(&all[off..off + len]);
-        off += len;
-    }
-    out
-}
-
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -346,7 +303,19 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     let rest = &text[i..];
     let a = rest.find('"').unwrap() + 1;
     let b = a + rest[a..].find('"').unwrap();
-    parse_ts(rest[a..b].as_bytes()).expect("manifest ts")
+    let v = rest[a..b].as_bytes();
+    if let Some(t) = parse_ts(v) {
+        return t;
+    }
+    // Tolerate fractional seconds (".123") in the manifest only.
+    let dot = v.iter().position(|&c| c == b'.').expect("manifest ts");
+    let end = dot + 1 + v[dot + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let mut frac: Vec<u8> = v[dot + 1..end].to_vec();
+    frac.resize(3, b'0');
+    let ms: i64 = std::str::from_utf8(&frac[..3]).unwrap().parse().unwrap();
+    let mut whole = v[..dot].to_vec();
+    whole.extend_from_slice(&v[end..]);
+    parse_ts(&whole).expect("manifest ts") + ms
 }
 
 // ---------------------------------------------------------------- records
@@ -621,13 +590,7 @@ fn main() {
         .iter()
         .flat_map(|(d, k)| list_csv(&data.join(d)).into_iter().map(move |p| (*k, p)))
         .collect();
-    let mode = std::env::var("READ_MODE").unwrap_or_else(|_| "populate".into());
-    let mapped: Vec<(u8, S)> = if mode == "read" {
-        let files: Vec<S> = read_files(&paths.iter().map(|p| p.1.clone()).collect::<Vec<_>>());
-        paths.iter().map(|p| p.0).zip(files).collect()
-    } else {
-        paths.par_iter().map(|(k, p)| (*k, map_file(p, mode == "populate"))).collect()
-    };
+    let mapped: Vec<(u8, S)> = paths.par_iter().map(|(k, p)| (*k, map_file(p, true))).collect();
     let pick = |k: u8| -> Vec<S> { mapped.iter().filter(|m| m.0 == k).map(|m| m.1).collect() };
     let (ev_files, ck_files, ln_files) = (pick(0), pick(1), pick(2));
     log!(t0, "setup: {} event files, {} click files, {} link files, ndays {ndays}", ev_files.len(), ck_files.len(), ln_files.len());
