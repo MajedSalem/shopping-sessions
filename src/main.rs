@@ -42,7 +42,10 @@ impl Hasher for IdHasher {
     }
     #[inline]
     fn write_u128(&mut self, v: u128) {
-        self.0 = (v as u64) ^ ((v >> 64) as u64).rotate_left(17);
+        let mut h = (v as u64) ^ ((v >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        self.0 = h ^ (h >> 32);
     }
 }
 type BH = BuildHasherDefault<IdHasher>;
@@ -439,15 +442,16 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 
 // ---------------------------------------------------------------- exact IDs
 
-/// An ID string packed exactly into 128 bits: up to 15 bytes big-endian in the high
-/// bytes, the length in the low byte. Comparing two packed IDs (hi, then lo) is the
-/// byte-wise comparison of the strings. Longer strings get a 120-bit hash with 0xFF as
-/// the low byte and are kept in a side table; comparisons involving them use the bytes.
+/// An ID string packed exactly into 64 bits, when it is "canonical": 1 to 10 bytes, any
+/// first byte, the rest from [0-9a-z]. The first byte goes in bits 47..55; the rest are
+/// base-37 digits (1..=36, 0 pads shorter strings) in bits 0..47 (37^9 < 2^47).
+/// Comparing two canonical codes is the byte-wise comparison of the strings.
+/// Anything else (uppercase, spaces, '\r', longer IDs, ...) gets bit 63 plus a 63-bit
+/// hash and goes into a side table; comparisons involving it use the bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-struct Id {
-    hi: u64,
-    lo: u64,
-}
+struct Id(u64);
+
+const FALLBACK: u64 = 1 << 63;
 
 impl std::hash::Hash for Id {
     #[inline]
@@ -458,39 +462,65 @@ impl std::hash::Hash for Id {
 
 #[inline]
 fn mix(a: Id) -> u64 {
-    let mut h = a.hi ^ a.lo.rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h ^= h >> 32;
-    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let mut h = a.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= h >> 32;
     h
 }
 
-static LONG_IDS: std::sync::OnceLock<Mutex<HashMap<Id, S>>> = std::sync::OnceLock::new();
+const fn b37_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = 1 + i as u8;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 26 {
+        t[b'a' as usize + j] = 11 + j as u8;
+        j += 1;
+    }
+    t
+}
+static B37: [u8; 256] = b37_table();
+const B37_CHARS: &[u8; 37] = b"\x000123456789abcdefghijklmnopqrstuvwxyz";
+
+const SHARDS: usize = 64;
+static FALLBACK_IDS: std::sync::OnceLock<Vec<Mutex<HashMap<u64, S>>>> = std::sync::OnceLock::new();
+
+fn fallback_table() -> &'static Vec<Mutex<HashMap<u64, S>>> {
+    FALLBACK_IDS.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect())
+}
 
 #[inline]
 fn enc(s: S) -> Id {
     let n = s.len();
-    if n <= 15 {
-        let mut b = [0u8; 16];
-        b[..n].copy_from_slice(s);
-        b[15] = n as u8;
-        Id { hi: u64::from_be_bytes(b[..8].try_into().unwrap()), lo: u64::from_be_bytes(b[8..].try_into().unwrap()) }
-    } else {
-        enc_long(s)
+    if (1..=10).contains(&n) {
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for i in 1..10 {
+            let d = if i < n { B37[s[i] as usize] } else { 0 };
+            ok &= d != 0 || i >= n;
+            v = v * 37 + d as u64;
+        }
+        if ok {
+            return Id(((s[0] as u64) << 47) | v);
+        }
     }
+    enc_fallback(s)
 }
 
 #[cold]
-fn enc_long(s: S) -> Id {
-    let h = xxh3_128(s);
-    let id = Id { hi: (h >> 64) as u64, lo: (h as u64) | 0xFF };
-    LONG_IDS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(id).or_insert(s);
-    id
+fn enc_fallback(s: S) -> Id {
+    let code = FALLBACK | (xxh3_64(s) >> 1);
+    fallback_table()[(code % SHARDS as u64) as usize].lock().unwrap().entry(code).or_insert(s);
+    Id(code)
 }
 
 #[inline]
 fn is_long(a: Id) -> bool {
-    a.lo & 0xFF == 0xFF
+    a.0 & FALLBACK != 0
 }
 
 struct IdStr {
@@ -511,13 +541,26 @@ impl IdStr {
 #[inline]
 fn decode(a: Id) -> IdStr {
     if is_long(a) {
-        let s = *LONG_IDS.get().unwrap().lock().unwrap().get(&a).unwrap();
+        let s = *fallback_table()[(a.0 % SHARDS as u64) as usize].lock().unwrap().get(&a.0).unwrap();
         return IdStr { b: [0; 16], n: 0, long: Some(s) };
     }
     let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&a.hi.to_be_bytes());
-    b[8..].copy_from_slice(&a.lo.to_be_bytes());
-    IdStr { b, n: (a.lo & 0xFF) as usize, long: None }
+    b[0] = (a.0 >> 47) as u8;
+    let mut rest = a.0 & ((1u64 << 47) - 1);
+    let mut digits = [0u8; 9];
+    for i in (0..9).rev() {
+        digits[i] = (rest % 37) as u8;
+        rest /= 37;
+    }
+    let mut n = 1;
+    for &d in &digits {
+        if d == 0 {
+            break;
+        }
+        b[n] = B37_CHARS[d as usize];
+        n += 1;
+    }
+    IdStr { b, n, long: None }
 }
 
 /// Byte-wise order of the original strings.
@@ -527,6 +570,21 @@ fn id_cmp(a: Id, b: Id) -> std::cmp::Ordering {
         a.cmp(&b)
     } else {
         decode(a).bytes().cmp(decode(b).bytes())
+    }
+}
+
+/// Exact 128-bit key for lookup-only strings (products, campaigns): up to 15 bytes plus
+/// length; longer strings hash to 120 bits with 0xFF as the length byte.
+#[inline]
+fn key128(s: &[u8]) -> u128 {
+    let n = s.len();
+    if n <= 15 {
+        let mut b = [0u8; 16];
+        b[..n].copy_from_slice(s);
+        b[15] = n as u8;
+        u128::from_be_bytes(b)
+    } else {
+        xxh3_128(s) | 0xFF
     }
 }
 
@@ -671,7 +729,7 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
                 for a in p {
                     m.entry(a).or_insert_with(|| {
                         list.push(a);
-                        Id { hi: 0, lo: (list.len() - 1) as u64 }
+                        Id((list.len() - 1) as u64)
                     });
                 }
             }
@@ -685,7 +743,7 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
     let n = off[NB] as usize;
     let gidx = |a: Id| -> u32 {
         let b = bucket(a);
-        off[b] + maps[b].0[&a].lo as u32
+        off[b] + maps[b].0[&a].0 as u32
     };
     let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     edges.par_iter().for_each(|es| {
@@ -710,7 +768,7 @@ fn build_links(files: Vec<S>) -> Vec<LinkMap> {
     maps.par_iter_mut().enumerate().for_each(|(b, (m, _))| {
         let o = off[b];
         for v in m.values_mut() {
-            let r = uf_find(&parent, o + v.lo as u32) as usize;
+            let r = uf_find(&parent, o + v.0 as u32) as usize;
             *v = gid[best[r].load(Relaxed) as usize];
         }
     });
@@ -734,7 +792,10 @@ fn main() {
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let threads = if ncpu > 0 { ncpu } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) };
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
-    LONG_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if std::env::var("SELFTEST").is_ok() {
+        id_selftest();
+    }
+    fallback_table();
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
@@ -752,22 +813,22 @@ fn main() {
     cats.dedup();
     assert!(cats.len() <= 256, "too many categories");
     let unknown = cats.binary_search(&(&b"unknown"[..])).unwrap() as u8;
-    let mut prod_map: HashMap<Id, u8, BH> = HashMap::with_capacity_and_hasher(prods.len() * 2, BH::default());
+    let mut prod_map: HashMap<u128, u8, BH> = HashMap::with_capacity_and_hasher(prods.len() * 2, BH::default());
     for p in &prods {
         if !p[0].is_empty() {
-            prod_map.entry(enc(p[0])).or_insert(cats.binary_search(&p[1]).unwrap() as u8);
+            prod_map.entry(key128(p[0])).or_insert(cats.binary_search(&p[1]).unwrap() as u8);
         }
     }
     let ncat = cats.len();
     // campaigns
     let camps_raw = read_small(&data.join("campaigns.csv"));
-    let mut camp_map: HashMap<Id, u16, BH> = HashMap::with_capacity_and_hasher(camps_raw.len() * 2, BH::default());
+    let mut camp_map: HashMap<u128, u16, BH> = HashMap::with_capacity_and_hasher(camps_raw.len() * 2, BH::default());
     let mut camps: Vec<[S; 2]> = vec![];
     for c in &camps_raw {
         if c[0].is_empty() {
             continue;
         }
-        let k = enc(c[0]);
+        let k = key128(c[0]);
         if !camp_map.contains_key(&k) {
             camp_map.insert(k, camps.len() as u16);
             camps.push(*c);
@@ -1070,8 +1131,8 @@ fn main() {
     log!(t0, "done");
 }
 
-fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH>, unknown: u8) -> Parts<EvRaw> {
-    let lines = memchr_iter(b'\n', c).count() + 1;
+fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) -> Parts<EvRaw> {
+    let lines = c.len() / 70 + 1; // estimate: event lines are ~80 bytes
     let mut parts: Parts<EvRaw> = new_parts(lines / NB + lines / NB / 4 + 16);
     scan::<7>(c, |f| {
         let eid = f[0];
@@ -1094,7 +1155,7 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH>, unknown:
                 b"view" | b"cart" => {}
                 b"purchase" => match parse_price(f[6]) {
                     Some(p) => {
-                        let cat = *prod_map.get(&enc(f[5])).unwrap_or(&unknown) as u32;
+                        let cat = *prod_map.get(&key128(f[5])).unwrap_or(&unknown) as u32;
                         r.pc = p | (cat << 24);
                     }
                     None => break 'v,
@@ -1112,8 +1173,8 @@ fn parse_events(c: S, ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH>, unknown:
     parts
 }
 
-fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &HashMap<Id, u16, BH>) -> Parts<ClickRec> {
-    let lines = memchr_iter(b'\n', c).count() + 1;
+fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>) -> Parts<ClickRec> {
+    let lines = c.len() / 45 + 1; // estimate: click lines are ~50 bytes
     let mut parts: Parts<ClickRec> = new_parts(lines / NB + lines / NB / 4 + 16);
     scan::<4>(c, |f| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -1123,7 +1184,7 @@ fn parse_clicks(c: S, cws: i64, we: i64, camp_map: &HashMap<Id, u16, BH>) -> Par
             Some(t) if t >= cws && t < we => t,
             _ => return,
         };
-        let camp = match camp_map.get(&enc(f[2])) {
+        let camp = match camp_map.get(&key128(f[2])) {
             Some(&c) => c,
             None => return,
         };
@@ -1281,7 +1342,7 @@ fn write_outputs(out: &Path, user_rows: Vec<Vec<URow>>, total: &[CAcc], camps: &
 }
 
 /// Temporary: time the event parse in layers (EXP=1).
-fn parse_experiment(files: &[S], ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH>, unknown: u8) {
+fn parse_experiment(files: &[S], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8) {
     use std::hint::black_box;
     let ch = chunks(files, CHUNK);
     let mut best = [f64::MAX; 6];
@@ -1298,7 +1359,7 @@ fn parse_experiment(files: &[S], ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH
                         2 => scan::<7>(c, |f| {
                             let e = enc(f[0]);
                             let u = enc(f[1]);
-                            acc ^= e.lo ^ u.hi;
+                            acc ^= e.0 ^ u.0;
                         }),
                         3 => scan::<7>(c, |f| {
                             let a = parse_ts(f[2]).unwrap_or(0);
@@ -1330,4 +1391,51 @@ fn parse_experiment(files: &[S], ws: i64, we: i64, prod_map: &HashMap<Id, u8, BH
     for l in 0..6 {
         eprintln!("best of 5: level {l} {:<22} {:>7.3}s", names[l], best[l]);
     }
+}
+
+/// Self-test of the ID encoding (SELFTEST=1): round trip and order on random strings.
+fn id_selftest() {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let alpha: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let odd: &[u8] = b"ABZ _\r\t\"-\x00\xc3";
+    let mut strs: Vec<Vec<u8>> = Vec::new();
+    for i in 0..20000 {
+        let len = match i % 7 { 0 => 1, 1 => 9, 2 => 10, 3 => 11, 4 => 16, _ => 1 + (rnd() % 12) as usize };
+        let mut s = Vec::with_capacity(len);
+        for j in 0..len {
+            let r = rnd();
+            let c = if j == 0 && r % 3 == 0 { (r >> 8) as u8 } else if r % 50 == 0 { odd[(r >> 8) as usize % odd.len()] } else { alpha[(r >> 8) as usize % alpha.len()] };
+            s.push(c);
+        }
+        strs.push(s);
+    }
+    strs.push(b"u".to_vec());
+    strs.push(b"u0".to_vec());
+    strs.push(b"u00".to_vec());
+    strs.push(b"uzzzzzzzzz".to_vec());
+    let leaked: Vec<S> = strs.into_iter().map(|s| &*Box::leak(s.into_boxed_slice())).collect();
+    let ids: Vec<Id> = leaked.iter().map(|s| enc(s)).collect();
+    let mut fails = 0;
+    for (s, id) in leaked.iter().zip(&ids) {
+        if decode(*id).bytes() != *s {
+            fails += 1;
+        }
+    }
+    let n = leaked.len();
+    for _ in 0..2_000_000 {
+        let a = (rnd() % n as u64) as usize;
+        let b = (rnd() % n as u64) as usize;
+        if id_cmp(ids[a], ids[b]) != leaked[a].cmp(leaked[b]) || (ids[a] == ids[b]) != (leaked[a] == leaked[b]) {
+            fails += 1;
+        }
+    }
+    let canon = ids.iter().filter(|i| !is_long(**i)).count();
+    eprintln!("id selftest: {n} strings ({canon} canonical), failures: {fails}");
+    std::process::exit(if fails == 0 { 0 } else { 1 });
 }
