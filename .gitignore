@@ -3,3 +3,14 @@ dev/
 data*/
 out*/
 OPTIMIZATION_LOG.md
+RECENT_REPOS.md
+# local development notes and helper scripts (kept on disk, not published)
+HANDOFF.md
+wsl_env.sh
+scripts/*
+!scripts/run_fixtures.py
+!scripts/compare.py
+!scripts/check_fixtures.py
+!scripts/docker_run.sh
+!scripts/dock_fx.sh
+!scripts/ci_bench.sh
