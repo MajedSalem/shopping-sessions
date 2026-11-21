@@ -120,8 +120,8 @@ jobs:
             cargo build --release --locked --target-dir /tmp/target_prof 2>&1 | tail -1)
           rm -rf /tmp/pout && mkdir /tmp/pout
           perf record -F 1999 -g -o /tmp/perf.data -- env DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/pout NCPU="$(nproc)" /tmp/target_prof/release/sessions 2> /dev/null
-          perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -40 > /tmp/report/perf_symbols.txt
-          perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -60 > /tmp/report/perf_lines.txt
+          perf report -i /tmp/perf.data --no-children -g none --percent-limit 0.3 --sort symbol --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -40 > /tmp/report/perf_symbols.txt
+          perf report -i /tmp/perf.data --no-children -g none --percent-limit 0.3 --sort srcline --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -60 > /tmp/report/perf_lines.txt
           { echo "### perf: hottest symbols (head)"; echo '```'; head -25 /tmp/report/perf_symbols.txt; echo '```';
             echo "### perf: hottest source lines (head)"; echo '```'; head -40 /tmp/report/perf_lines.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
