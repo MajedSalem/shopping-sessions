@@ -1784,7 +1784,335 @@ fn utf8(s: &[u8]) -> std::borrow::Cow<'_, str> {
 }
 
 #[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------- minimal Parquet writer
+
+/// A minimal Parquet writer: format v1, uncompressed, one row group, one PLAIN data page per
+/// column, flat schema of required/optional columns. Thrift compact encoding by hand.
+mod pq {
+    use std::io::Write;
+
+    pub const INT32: i32 = 1;
+    pub const INT64: i32 = 2;
+    pub const BYTE_ARRAY: i32 = 6;
+
+    /// Logical annotation of a column.
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Ann {
+        None,
+        String,
+        Date,
+    }
+
+    pub struct Col {
+        pub name: &'static str,
+        pub ptype: i32,
+        pub ann: Ann,
+        pub optional: bool,
+        pub num_values: usize, // including nulls
+        pub def: Vec<u8>,      // encoded definition levels (optional columns), with length prefix
+        pub values: Vec<u8>,   // PLAIN values (nulls omitted)
+    }
+
+    impl Col {
+        pub fn new(name: &'static str, ptype: i32, ann: Ann, optional: bool, rows: usize, value_bytes: usize) -> Col {
+            Col { name, ptype, ann, optional, num_values: 0, def: Vec::new(), values: Vec::with_capacity(value_bytes.max(rows * 4)) }
+        }
+        #[inline]
+        pub fn i32(&mut self, v: i32) {
+            self.values.extend_from_slice(&v.to_le_bytes());
+            self.num_values += 1;
+        }
+        #[inline]
+        pub fn i64(&mut self, v: i64) {
+            self.values.extend_from_slice(&v.to_le_bytes());
+            self.num_values += 1;
+        }
+        #[inline]
+        pub fn bytes(&mut self, b: &[u8]) {
+            self.values.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            self.values.extend_from_slice(b);
+            self.num_values += 1;
+        }
+        /// Definition levels for an optional column: `present[i]` is 1 if row i is non-null.
+        /// One bit-packed run of width 1 (groups of 8, LSB first), with the 4-byte length prefix.
+        pub fn set_def(&mut self, present: &[u8]) {
+            let groups = present.len().div_ceil(8);
+            let mut body = Vec::with_capacity(groups + 10);
+            varint(&mut body, ((groups as u64) << 1) | 1);
+            for g in 0..groups {
+                let mut byte = 0u8;
+                for k in 0..8 {
+                    if present.get(g * 8 + k).copied().unwrap_or(0) != 0 {
+                        byte |= 1 << k;
+                    }
+                }
+                body.push(byte);
+            }
+            self.def.clear();
+            self.def.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            self.def.extend_from_slice(&body);
+            self.num_values = present.len();
+        }
+    }
+
+    fn varint(b: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            b.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        b.push(v as u8);
+    }
+
+    /// Thrift compact protocol, just what the Parquet footer and page headers need.
+    struct T {
+        b: Vec<u8>,
+        last: Vec<i16>,
+    }
+
+    const I32: u8 = 5;
+    const I64: u8 = 6;
+    const BIN: u8 = 8;
+    const LIST: u8 = 9;
+    const STRUCT: u8 = 12;
+
+    impl T {
+        fn new() -> T {
+            T { b: Vec::new(), last: vec![0] }
+        }
+        fn fh(&mut self, id: i16, ty: u8) {
+            let l = self.last.last_mut().unwrap();
+            let d = id - *l;
+            if d > 0 && d <= 15 {
+                self.b.push(((d as u8) << 4) | ty);
+            } else {
+                self.b.push(ty);
+                varint(&mut self.b, (((id as i32) << 1) ^ ((id as i32) >> 31)) as u32 as u64);
+            }
+            *l = id;
+        }
+        fn i32(&mut self, id: i16, v: i32) {
+            self.fh(id, I32);
+            varint(&mut self.b, ((v << 1) ^ (v >> 31)) as u32 as u64);
+        }
+        fn i64(&mut self, id: i16, v: i64) {
+            self.fh(id, I64);
+            varint(&mut self.b, ((v << 1) ^ (v >> 63)) as u64);
+        }
+        fn str(&mut self, id: i16, s: &[u8]) {
+            self.fh(id, BIN);
+            varint(&mut self.b, s.len() as u64);
+            self.b.extend_from_slice(s);
+        }
+        /// A struct-typed field; close with `end`.
+        fn begin(&mut self, id: i16) {
+            self.fh(id, STRUCT);
+            self.last.push(0);
+        }
+        /// A struct element of a list; close with `end`.
+        fn elem(&mut self) {
+            self.last.push(0);
+        }
+        fn end(&mut self) {
+            self.b.push(0);
+            self.last.pop();
+        }
+        fn list(&mut self, id: i16, ety: u8, n: usize) {
+            self.fh(id, LIST);
+            if n < 15 {
+                self.b.push(((n as u8) << 4) | ety);
+            } else {
+                self.b.push(0xF0 | ety);
+                varint(&mut self.b, n as u64);
+            }
+        }
+        fn list_i32(&mut self, v: i32) {
+            varint(&mut self.b, ((v << 1) ^ (v >> 31)) as u32 as u64);
+        }
+        fn list_str(&mut self, s: &[u8]) {
+            varint(&mut self.b, s.len() as u64);
+            self.b.extend_from_slice(s);
+        }
+        /// Closes the top-level struct.
+        fn finish(mut self) -> Vec<u8> {
+            self.b.push(0);
+            self.b
+        }
+    }
+
+    const PLAIN: i32 = 0;
+    const RLE: i32 = 3;
+
+    /// Writes one Parquet file with `rows` rows (0 rows: schema only, no row group).
+    pub fn write_file(path: &std::path::Path, rows: usize, cols: &[Col]) -> std::io::Result<()> {
+        let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.def.len() + c.values.len() + 64).sum::<usize>() + 4096);
+        out.extend_from_slice(b"PAR1");
+        let mut chunks = Vec::with_capacity(cols.len()); // (data page offset, chunk bytes)
+        if rows > 0 {
+            for c in cols {
+                assert_eq!(c.num_values, rows, "column {}", c.name);
+                let size = (c.def.len() + c.values.len()) as i32;
+                let mut h = T::new();
+                h.i32(1, 0); // DATA_PAGE
+                h.i32(2, size);
+                h.i32(3, size);
+                h.begin(5);
+                h.i32(1, rows as i32);
+                h.i32(2, PLAIN);
+                h.i32(3, RLE);
+                h.i32(4, RLE);
+                h.end();
+                let h = h.finish();
+                let off = out.len();
+                out.extend_from_slice(&h);
+                out.extend_from_slice(&c.def);
+                out.extend_from_slice(&c.values);
+                chunks.push((off as i64, (out.len() - off) as i64));
+            }
+        }
+        let mut m = T::new();
+        m.i32(1, 1); // version
+        m.list(2, STRUCT, cols.len() + 1);
+        m.elem();
+        m.str(4, b"schema");
+        m.i32(5, cols.len() as i32);
+        m.end();
+        for c in cols {
+            m.elem();
+            m.i32(1, c.ptype);
+            m.i32(3, c.optional as i32); // REQUIRED = 0, OPTIONAL = 1
+            m.str(4, c.name.as_bytes());
+            match c.ann {
+                Ann::String => m.i32(6, 0), // converted type UTF8
+                Ann::Date => m.i32(6, 6),   // converted type DATE
+                Ann::None => {}
+            }
+            if c.ann != Ann::None {
+                m.begin(10); // logical type (a union)
+                m.begin(if c.ann == Ann::String { 1 } else { 6 }); // STRING or DATE
+                m.end();
+                m.end();
+            }
+            m.end();
+        }
+        m.i64(3, rows as i64);
+        if rows > 0 {
+            m.list(4, STRUCT, 1);
+            m.elem();
+            m.list(1, STRUCT, cols.len());
+            for (c, &(off, len)) in cols.iter().zip(&chunks) {
+                m.elem();
+                m.i64(2, off); // file_offset
+                m.begin(3);
+                m.i32(1, c.ptype);
+                m.list(2, I32, 2);
+                m.list_i32(PLAIN);
+                m.list_i32(RLE);
+                m.list(3, BIN, 1);
+                m.list_str(c.name.as_bytes());
+                m.i32(4, 0); // UNCOMPRESSED
+                m.i64(5, rows as i64);
+                m.i64(6, len);
+                m.i64(7, len);
+                m.i64(9, off);
+                m.end();
+                m.end();
+            }
+            let total: i64 = chunks.iter().map(|c| c.1).sum();
+            m.i64(2, total);
+            m.i64(3, rows as i64);
+            m.end();
+        } else {
+            m.list(4, STRUCT, 0);
+        }
+        m.str(6, b"sessions");
+        let meta = m.finish();
+        out.extend_from_slice(&meta);
+        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"PAR1");
+        std::fs::File::create(path)?.write_all(&out)
+    }
+}
+
+/// The outputs through the minimal writer (`PQ_ARROW=1`: through arrow-rs instead).
 fn write_outputs(out: &Path, user_rows: Vec<Vec<URow>>, total: &[CAcc], camps: &[[S; 2]], ncamp: usize, ndays: usize, day0: i64, cats: &[S]) {
+    if std::env::var_os("PQ_ARROW").is_some() {
+        return write_outputs_arrow(out, user_rows, total, camps, ncamp, ndays, day0, cats);
+    }
+    use pq::{Ann, Col};
+    let ud = out.join("user_daily");
+    let cd = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let nfiles = 16usize;
+    let per = user_rows.len().div_ceil(nfiles).max(1);
+    let groups: Vec<&[Vec<URow>]> = user_rows.chunks(per).collect();
+    let total_rows: usize = user_rows.iter().map(|r| r.len()).sum();
+    groups.par_iter().enumerate().for_each(|(gi, g)| {
+        let n: usize = g.iter().map(|r| r.len()).sum();
+        if n == 0 && !(gi == 0 && total_rows == 0) {
+            return; // no empty files, except one when the table has no rows at all
+        }
+        let mut c_user = Col::new("user_id", pq::BYTE_ARRAY, Ann::String, false, n, n * 14);
+        let mut c_day = Col::new("day", pq::INT32, Ann::Date, false, n, n * 4);
+        let mut c_s = Col::new("sessions", pq::INT32, Ann::None, false, n, n * 4);
+        let mut c_e = Col::new("events", pq::INT32, Ann::None, false, n, n * 4);
+        let mut c_r = Col::new("revenue_cents", pq::INT64, Ann::None, false, n, n * 8);
+        let mut c_t = Col::new("top_category", pq::BYTE_ARRAY, Ann::String, true, n, n * 6);
+        let mut present: Vec<u8> = Vec::with_capacity(n);
+        for rows in g.iter() {
+            for r in rows {
+                c_user.bytes(decode(r.name).bytes());
+                c_day.i32(r.day);
+                c_s.i32(r.sessions as i32);
+                c_e.i32(r.events as i32);
+                c_r.i64(r.revenue as i64);
+                match r.top {
+                    Some(c) => {
+                        c_t.bytes(cats[c as usize]);
+                        present.push(1);
+                    }
+                    None => present.push(0),
+                }
+            }
+        }
+        c_t.set_def(&present);
+        pq::write_file(&ud.join(format!("part-{gi:05}.parquet")), n, &[c_user, c_day, c_s, c_e, c_r, c_t]).unwrap();
+    });
+
+    let mut rows = 0usize;
+    let mut c_c = Col::new("campaign_id", pq::BYTE_ARRAY, Ann::String, false, 0, 0);
+    let mut c_ch = Col::new("channel", pq::BYTE_ARRAY, Ann::String, false, 0, 0);
+    let mut c_day = Col::new("day", pq::INT32, Ann::Date, false, 0, 0);
+    let mut c_s = Col::new("sessions", pq::INT64, Ann::None, false, 0, 0);
+    let mut c_p = Col::new("purchasing_sessions", pq::INT64, Ann::None, false, 0, 0);
+    let mut c_r = Col::new("revenue_cents", pq::INT64, Ann::None, false, 0, 0);
+    let mut c_a = Col::new("assisted_sessions", pq::INT64, Ann::None, false, 0, 0);
+    for c in 0..=ncamp {
+        for d in 0..ndays {
+            let a = &total[c * ndays + d];
+            if a.sessions == 0 && a.assisted == 0 {
+                continue;
+            }
+            if c == ncamp {
+                c_c.bytes(b"organic");
+                c_ch.bytes(b"organic");
+            } else {
+                c_c.bytes(camps[c][0]);
+                c_ch.bytes(camps[c][1]);
+            }
+            c_day.i32((day0 + d as i64) as i32);
+            c_s.i64(a.sessions as i64);
+            c_p.i64(a.purchasing as i64);
+            c_r.i64(a.revenue as i64);
+            c_a.i64(if c == ncamp { 0 } else { a.assisted as i64 });
+            rows += 1;
+        }
+    }
+    pq::write_file(&cd.join("part-00000.parquet"), rows, &[c_c, c_ch, c_day, c_s, c_p, c_r, c_a]).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_outputs_arrow(out: &Path, user_rows: Vec<Vec<URow>>, total: &[CAcc], camps: &[[S; 2]], ncamp: usize, ndays: usize, day0: i64, cats: &[S]) {
     use arrow_array::builder::{Date32Builder, Int64Builder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
