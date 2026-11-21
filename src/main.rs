@@ -512,6 +512,70 @@ fn bit_range(a: u32, b: u32) -> u64 {
 #[inline]
 fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = data.len();
+    let mut ls = 0usize; // start of the current line
+    // Line at a time: masks of the 128 bytes from the line start; the first newline ends the
+    // line, its commas must number exactly N - 1, and they are peeled off with tzcnt. The
+    // quote rule is checked on the quote mask. Lines near the end of `data`, or longer than
+    // 127 bytes, go to the block scanner (same rules).
+    while ls + 128 <= len {
+        // SAFETY: ls + 128 <= len
+        let p: &[u8; 128] = unsafe { &*(data.as_ptr().add(ls) as *const [u8; 128]) };
+        let (c0, n0, q0) = masks64(p[..64].try_into().unwrap());
+        let (c1, n1, q1) = masks64(p[64..].try_into().unwrap());
+        let nlm = (n0 as u128) | ((n1 as u128) << 64);
+        if nlm == 0 {
+            break;
+        }
+        let nl = nlm.trailing_zeros() as usize;
+        let lim = (1u128 << nl) - 1;
+        let mut c = ((c0 as u128) | ((c1 as u128) << 64)) & lim;
+        let q = ((q0 as u128) | ((q1 as u128) << 64)) & lim;
+        let next = ls + nl + 1;
+        if c.count_ones() as usize != N - 1 {
+            ls = next; // malformed (wrong field count; an empty line has none)
+            continue;
+        }
+        let mut st = [0usize; N];
+        let mut en = [0usize; N];
+        for i in 0..N - 1 {
+            let t = c.trailing_zeros() as usize;
+            en[i] = t;
+            st[i + 1] = t + 1;
+            c &= c - 1;
+        }
+        en[N - 1] = nl;
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        if q == 0 {
+            for i in 0..N {
+                // SAFETY: st[i] <= en[i] <= nl < 128, within data[ls..ls + 128]
+                out[i] = unsafe { data.get_unchecked(ls + st[i]..ls + en[i]) };
+            }
+        } else {
+            let mut good = 0u32;
+            for i in 0..N {
+                let (s, e) = (st[i], en[i]);
+                let wrapped = e >= s + 2 && (q >> s) & 1 != 0 && (q >> (e - 1)) & 1 != 0;
+                let (s, e) = if wrapped { (s + 1, e - 1) } else { (s, e) };
+                good += wrapped as u32;
+                out[i] = unsafe { data.get_unchecked(ls + s..ls + e) };
+            }
+            if q.count_ones() != 2 * good {
+                ls = next; // a quote somewhere other than around a whole field
+                continue;
+            }
+        }
+        f(&out);
+        ls = next;
+    }
+    if ls < len {
+        scan_blocks::<N>(&data[ls..], f);
+    }
+}
+
+/// The block scanner: 64-byte masks, walking the separator bits. `scan` uses it for the lines
+/// it doesn't take itself. `data` starts at a line start.
+fn scan_blocks<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
     let mut starts = [0usize; N];
     let mut ends = [0usize; N];
     let mut k = 0usize; // fields closed so far in this line; N means too many
@@ -2387,6 +2451,51 @@ fn id_selftest() {
     let fails = fails + efails;
     let canon = ids.iter().filter(|i| !is_long(**i)).count();
     eprintln!("id selftest: {n} strings ({canon} canonical) + 400000 enc-vs-ref, failures: {fails}");
+    // scanner: the line-at-a-time path against the block scanner on dirty CSV
+    let mut sfails = 0usize;
+    let mut lines_ok = 0usize;
+    let pieces: &[&[u8]] = &[b"", b"\"\"", b"u1", b"\"u1\"", b"\"u1", b"u1\"", b"u\"1", b"\"", b"\"\"\"", b"x\r", b"\"x\"\r", b"\"x\r\"", b" u1", b"2027-12-12T00:34:47Z", b"1828679388000", b"e9pr3kfk5"];
+    for round in 0..20_000 {
+        let mut buf: Vec<u8> = Vec::new();
+        let nlines = 1 + (rnd() % 40) as usize;
+        for _ in 0..nlines {
+            let r = rnd();
+            if r % 31 == 0 {
+                buf.push(b'\n'); // empty line
+                continue;
+            }
+            // mostly 7 fields, sometimes 6 or 8; sometimes one very long field
+            let nf = match r % 13 { 0 => 6, 1 => 8, _ => 7 };
+            for k in 0..nf {
+                if k > 0 {
+                    buf.push(b',');
+                }
+                let r2 = rnd();
+                if r2 % 97 == 0 {
+                    buf.extend(std::iter::repeat(b'a').take(60 + (r2 >> 8) as usize % 140));
+                } else {
+                    buf.extend_from_slice(pieces[(r2 >> 8) as usize % pieces.len()]);
+                }
+            }
+            buf.push(b'\n');
+        }
+        if round % 5 == 0 {
+            buf.pop(); // no newline at the very end
+        }
+        let mut a: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut b: Vec<Vec<Vec<u8>>> = Vec::new();
+        scan::<7>(&buf, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
+        scan_blocks::<7>(&buf, |f| b.push(f.iter().map(|x| x.to_vec()).collect()));
+        lines_ok += b.len();
+        if a != b {
+            sfails += 1;
+            if sfails <= 3 {
+                eprintln!("  scan mismatch on {:?}", String::from_utf8_lossy(&buf));
+            }
+        }
+    }
+    eprintln!("scan selftest: 20000 buffers ({lines_ok} well-formed lines), failures: {sfails}");
+    let fails = fails + sfails;
     // timestamps: fast parser vs byte-at-a-time reference
     let mut tfails = 0u64;
     let mut tvalid = 0u64;
