@@ -1509,10 +1509,16 @@ fn main() {
     // ---- stage 3: sessions per person
     let nthreads = rayon::current_num_threads();
     let accs: Vec<Mutex<Vec<CAcc>>> = (0..nthreads).map(|_| Mutex::new(vec![CAcc::default(); (ncamp + 1) * ndays])).collect();
-    let user_rows: Vec<Vec<URow>> = ev_r
+    // Biggest buckets first (whales and the shared-device person make a few much bigger), so
+    // none of them starts last and holds up the stage.
+    let mut work: Vec<(Vec<&[SessEv]>, Vec<&[ClickRec]>)> = ev_r.into_iter().zip(ck_r).collect();
+    work.sort_by_key(|(e, c)| std::cmp::Reverse(e.iter().map(|p| p.len()).sum::<usize>() + c.iter().map(|p| p.len()).sum::<usize>()));
+    let user_rows: Vec<Vec<URow>> = work
         .into_par_iter()
-        .zip(ck_r.into_par_iter())
+        .with_max_len(1)
         .map(|(eparts, cparts)| {
+            let mut scratch_e: Vec<SessEv> = Vec::new();
+            let mut scratch_c: Vec<ClickRec> = Vec::new();
             let mut evs: Vec<SessEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
             for p in eparts {
                 evs.extend_from_slice(p);
@@ -1587,12 +1593,28 @@ fn main() {
             let wk = WEEK as u32;
             for p in 0..np {
                 let pe = &mut sorted[eoff[p] as usize..eoff[p + 1] as usize];
-                if pe.len() > 1 {
+                if pe.len() > RADIX_MIN {
+                    radix_by_ts(pe, &mut scratch_e, |e| e.ts);
+                } else if pe.len() > 1 {
                     pe.sort_unstable_by_key(|e| e.ts);
                 }
                 let pe = &*pe;
                 let pc = &mut csorted[coff[p] as usize..coff[p + 1] as usize];
-                if pc.len() > 1 {
+                if pc.len() > RADIX_MIN {
+                    // by ts, then runs of equal ts by click_id
+                    radix_by_ts(pc, &mut scratch_c, |c| c.ts);
+                    let mut i = 0;
+                    while i < pc.len() {
+                        let mut j = i + 1;
+                        while j < pc.len() && pc[j].ts == pc[i].ts {
+                            j += 1;
+                        }
+                        if j - i > 1 {
+                            pc[i..j].sort_unstable_by(|a, b| id_cmp(a.cid, b.cid));
+                        }
+                        i = j;
+                    }
+                } else if pc.len() > 1 {
                     pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| id_cmp(a.cid, b.cid)));
                 }
                 let pc = &*pc;
@@ -1760,6 +1782,46 @@ fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, 
         let u = enc(f[1]);
         w.push(bucket(u), ClickRec { key: u, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
     }));
+}
+
+/// People with more events (or clicks) than this are sorted by radix instead of comparisons.
+const RADIX_MIN: usize = 256;
+
+/// Sorts `v` by a u32 key in three stable counting passes of 11 bits (linear time, for the few
+/// very large people). Order among equal keys is unspecified, as with `sort_unstable`.
+fn radix_by_ts<T: Copy>(v: &mut [T], scratch: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    let n = v.len();
+    scratch.clear();
+    scratch.extend_from_slice(v);
+    let (mut src, mut dst): (&mut [T], &mut [T]) = (v, &mut scratch[..]);
+    let mut in_v = true;
+    for pass in 0..3u32 {
+        let sh = pass * 11;
+        let mut cnt = [0u32; 2048];
+        for x in src.iter() {
+            cnt[((key(x) >> sh) & 2047) as usize] += 1;
+        }
+        if cnt.iter().any(|&c| c as usize == n) {
+            continue; // every key has the same digit: this pass changes nothing
+        }
+        let mut acc = 0u32;
+        for c in cnt.iter_mut() {
+            let t = *c;
+            *c = acc;
+            acc += t;
+        }
+        for x in src.iter() {
+            let d = ((key(x) >> sh) & 2047) as usize;
+            dst[cnt[d] as usize] = *x;
+            cnt[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        in_v = !in_v;
+    }
+    if !in_v {
+        // the result is in scratch
+        dst.copy_from_slice(src);
+    }
 }
 
 #[inline]
