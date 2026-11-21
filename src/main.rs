@@ -1202,7 +1202,7 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
     }
 }
 
-fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
+fn build_links(files: Vec<FileRef>) -> LinkTab {
     let parsed: Vec<(Vec<(Id, Id)>, Parts<Id>)> = for_each_piece(&files, |c| {
             let mut edges = vec![];
             let mut ids: Parts<Id> = new_parts(0);
@@ -1222,7 +1222,7 @@ fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
     let (edges, idparts): (Vec<Vec<(Id, Id)>>, Vec<Parts<Id>>) = parsed.into_iter().unzip();
     let idparts = transpose(idparts);
     // per bucket: unique ids; the map value temporarily holds the local index in `lo`
-    let mut maps: Vec<(LinkMap, Vec<Id>)> = idparts
+    let maps: Vec<(LinkMap, Vec<Id>)> = idparts
         .into_par_iter()
         .map(|parts| {
             let n: usize = parts.iter().map(|p| p.len()).sum();
@@ -1268,21 +1268,118 @@ fn build_links(files: Vec<FileRef>) -> Vec<LinkMap> {
             }
         }
     });
-    maps.par_iter_mut().enumerate().for_each(|(b, (m, _))| {
-        let o = off[b];
-        for v in m.values_mut() {
-            let r = uf_find(&parent, o + v.0 as u32) as usize;
-            *v = gid[best[r].load(Relaxed) as usize];
-        }
-    });
-    maps.into_iter().map(|(m, _)| m).collect()
+    // Only renamed ids (name != id) need an entry: everything else is its own person.
+    let renamed: Vec<Vec<(Id, Id)>> = maps
+        .par_iter()
+        .enumerate()
+        .map(|(b, (m, _))| {
+            let o = off[b];
+            m.iter()
+                .filter_map(|(&k, v)| {
+                    let r = uf_find(&parent, o + v.0 as u32) as usize;
+                    let name = gid[best[r].load(Relaxed) as usize];
+                    (name != k).then_some((k, name))
+                })
+                .collect()
+        })
+        .collect();
+    LinkTab::build(renamed)
 }
 
-#[inline]
-fn resolve(maps: &[LinkMap], b: usize, u: Id) -> Id {
-    match maps[b].get(&u) {
-        Some(v) => *v,
-        None => u,
+/// Renamed id -> person, as open addressing over 16-byte entries: one region per bucket (so
+/// regions build in parallel), linear probing inside it. A lookup is usually one cache line,
+/// which `prefetch` can fetch ahead of time.
+struct LinkTab {
+    regions: Vec<Box<[(u64, u64)]>>,
+    mask: usize,
+    max_key: Option<Id>, // the person of id u64::MAX (the empty marker), if renamed
+}
+
+const EMPTY: u64 = u64::MAX;
+
+impl LinkTab {
+    fn build(per_bucket: Vec<Vec<(Id, Id)>>) -> LinkTab {
+        let most = per_bucket.iter().map(|v| v.len()).max().unwrap_or(0);
+        let size = (most * 2).next_power_of_two().max(8); // load factor <= 1/2
+        let mask = size - 1;
+        let max_key = per_bucket.iter().flatten().find(|(k, _)| k.0 == EMPTY).map(|&(_, v)| v);
+        let regions = per_bucket
+            .into_par_iter()
+            .map(|list| {
+                let mut r = filled(size, (EMPTY, 0u64)).into_boxed_slice();
+                for (k, v) in list {
+                    if k.0 == EMPTY {
+                        continue;
+                    }
+                    let mut i = mix(k) as usize & mask;
+                    while r[i].0 != EMPTY {
+                        i = (i + 1) & mask;
+                    }
+                    r[i] = (k.0, v.0);
+                }
+                r
+            })
+            .collect();
+        LinkTab { regions, mask, max_key }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, u: Id) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let r = self.regions.get_unchecked(bucket(u));
+            _mm_prefetch::<_MM_HINT_T0>(r.as_ptr().add(mix(u) as usize & self.mask) as *const i8);
+        }
+    }
+
+    /// The person (their name) of user id `u`.
+    #[inline(always)]
+    fn get(&self, u: Id) -> Id {
+        if u.0 == EMPTY {
+            return self.max_key.unwrap_or(u);
+        }
+        let r = unsafe { self.regions.get_unchecked(bucket(u)) };
+        let mut i = mix(u) as usize & self.mask;
+        loop {
+            let (k, v) = unsafe { *r.get_unchecked(i) };
+            if k == u.0 {
+                return Id(v);
+            }
+            if k == EMPTY {
+                return u;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// Lines waiting for their link-table entry to arrive in cache: a line is finished RING lines
+/// after its entry was prefetched.
+const RING: usize = 16;
+
+struct Ring<P: Copy> {
+    q: [P; RING],
+    n: usize,
+    pos: usize,
+}
+
+impl<P: Copy + Default> Ring<P> {
+    fn new() -> Self {
+        Ring { q: [P::default(); RING], n: 0, pos: 0 }
+    }
+    /// Queues `p`; returns the line it displaces, if the ring was full.
+    #[inline(always)]
+    fn push(&mut self, p: P) -> Option<P> {
+        let out = if self.n == RING { Some(self.q[self.pos]) } else { None };
+        self.q[self.pos] = p;
+        self.pos = (self.pos + 1) % RING;
+        self.n = (self.n + 1).min(RING);
+        out
+    }
+    /// The lines still queued.
+    fn rest(&self) -> impl Iterator<Item = P> + '_ {
+        (0..self.n).map(move |k| self.q[(self.pos + RING - self.n + k) % RING])
     }
 }
 
@@ -1640,10 +1737,39 @@ fn main() {
     unsafe { libc::_exit(0) };
 }
 
+/// A valid event copy waiting for its user's link-table entry.
+#[derive(Clone, Copy, Default)]
+struct PendEv {
+    eid: Id,
+    user: Id,
+    ingest: u32,
+    ts: u32,
+    pc: u32,
+}
+
 /// Every copy goes to its event-id partition as a `DRec`; a valid one also goes, once, to its
-/// person's partition as a `SessEv` (the person resolved here through the link maps).
-fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, links: &[LinkMap], dout: &Writers<DRec>, pout: &Writers<SessEv>) {
-    dout.with(|dw| pout.with(|pw| scan::<7>(c, |f| {
+/// person's partition as a `SessEv` (the person looked up here, through the prefetch ring).
+fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, links: &LinkTab, dout: &Writers<DRec>, pout: &Writers<SessEv>) {
+    dout.with(|dw| pout.with(|pw| {
+        let mut ring = Ring::<PendEv>::new();
+        let mut finish = |dw: &mut Writer<DRec>, p: PendEv| {
+            let person = links.get(p.user);
+            let pb = bucket(person);
+            let rec = off16(pw.next_at(pb));
+            pw.push(pb, SessEv { key: person, ts: p.ts, pc: p.pc });
+            dw.push(bucket(p.eid), DRec { eid: p.eid, ingest: p.ingest, rec });
+        };
+        scan::<7>(c, |f| parse_event_line(f, ws, we, prod_map, unknown, links, dw, &mut ring, &mut finish));
+        for p in ring.rest() {
+            finish(dw, p);
+        }
+    }));
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn parse_event_line(f: &[&[u8]; 7], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, links: &LinkTab, dw: &mut Writer<DRec>, ring: &mut Ring<PendEv>, finish: &mut impl FnMut(&mut Writer<DRec>, PendEv)) {
+    {
         let eid = f[0];
         if eid.is_empty() {
             return;
@@ -1651,7 +1777,6 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
         let eid = enc(eid);
         let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
-        let mut rec = NO_REC;
         'v: {
             let mut pc = 0u32;
             if f[1].is_empty() || f[5].is_empty() {
@@ -1675,18 +1800,34 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
             if ingest_ms - ts > DAY {
                 break 'v;
             }
-            let u = enc(f[1]);
-            let person = resolve(links, bucket(u), u);
-            let pb = bucket(person);
-            rec = off16(pw.next_at(pb));
-            pw.push(pb, SessEv { key: person, ts: (ts - ws) as u32, pc });
+            let user = enc(f[1]);
+            links.prefetch(user);
+            if let Some(p) = ring.push(PendEv { eid, user, ingest, ts: (ts - ws) as u32, pc }) {
+                finish(dw, p);
+            }
+            return;
         }
-        dw.push(bucket(eid), DRec { eid, ingest, rec });
-    })));
+        // invalid or late: no person record, but the copy still takes part in dedup
+        dw.push(bucket(eid), DRec { eid, ingest, rec: NO_REC });
+    }
 }
 
-fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, links: &[LinkMap], out: &Writers<ClickRec>) {
-    out.with(|w| scan::<4>(c, |f| {
+#[derive(Clone, Copy, Default)]
+struct PendClick {
+    user: Id,
+    cid: Id,
+    ts: u32,
+    camp: u16,
+}
+
+fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, links: &LinkTab, out: &Writers<ClickRec>) {
+    out.with(|w| {
+        let mut ring = Ring::<PendClick>::new();
+        let finish = |w: &mut Writer<ClickRec>, p: PendClick| {
+            let person = links.get(p.user);
+            w.push(bucket(person), ClickRec { key: person, cid: p.cid, ts: p.ts, camp: p.camp });
+        };
+        scan::<4>(c, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -1698,10 +1839,16 @@ fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, 
             Some(&c) => c,
             None => return,
         };
-        let u = enc(f[1]);
-        let person = resolve(links, bucket(u), u);
-        w.push(bucket(person), ClickRec { key: person, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
-    }));
+        let user = enc(f[1]);
+        links.prefetch(user);
+        if let Some(p) = ring.push(PendClick { user, cid: enc(f[0]), ts: (ts - cws) as u32, camp }) {
+            finish(w, p);
+        }
+        });
+        for p in ring.rest() {
+            finish(w, p);
+        }
+    });
 }
 
 #[inline]
