@@ -443,6 +443,12 @@ fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
             tail[..len - blk].copy_from_slice(&data[blk..]);
             &tail
         };
+        // A prefetch never faults, so running past the end of data is harmless.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(blk + 1024) as *const i8);
+        }
         let (cm, nl, qm) = masks64(block);
         let mut sep = cm | nl;
         let mut seg = 0u32;
@@ -908,8 +914,41 @@ fn huge_alloc(bytes: usize) -> *mut u8 {
         if std::env::var_os("NO_HUGEPAGES").is_none() {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
         }
+        REGIONS.lock().unwrap().push((p as usize, bytes));
         p as *mut u8
     }
+}
+
+/// Every `huge_alloc` region, so they can be released in parallel just before exit.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The kernel tears a process's memory down on one thread after `_exit`, and that time is
+/// still on the clock. `MADV_DONTNEED` only takes the address-space lock shared, so the
+/// threads drop the big regions' pages concurrently and exit is left with empty mappings.
+/// Call only when no region is used any more. `NO_RELEASE=1` skips it.
+fn release_regions() {
+    if std::env::var_os("NO_RELEASE").is_some() {
+        return;
+    }
+    let regions = std::mem::take(&mut *REGIONS.lock().unwrap());
+    // 8 MB pieces, so the big blocks spread over all threads too
+    const STEP: usize = 8 << 20;
+    let pieces: Vec<(usize, usize)> = regions
+        .iter()
+        .flat_map(|&(p, n)| (0..n).step_by(STEP).map(move |o| (p + o, STEP.min(n - o))))
+        .collect();
+    pieces.par_iter().for_each(|&(p, n)| unsafe {
+        libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+    });
+}
+
+/// A vector of `n` copies of `v`, written for real. `vec![0; n]` takes fresh zeroed pages whose
+/// first read maps the shared zero page; the write after it then faults again and flushes the
+/// TLB of every thread. The tables here are read-modify-written, so they pay that.
+fn filled<T: Copy>(n: usize, v: T) -> Vec<T> {
+    let mut x = Vec::with_capacity(n);
+    x.resize(n, v);
+    x
 }
 
 const BLOCK_BYTES: usize = 4 << 20;
@@ -1307,7 +1346,7 @@ fn main() {
             // collisions). Every other copy is the only one of its event.
             let slots = (total * 16).next_power_of_two().max(64);
             let smask = slots - 1;
-            let mut cnt = vec![0u64; slots / 32];
+            let mut cnt = filled(slots / 32, 0u64);
             for p in &parts {
                 for r in p.iter() {
                     let s = mix(r.eid) as usize & smask;
@@ -1324,7 +1363,7 @@ fn main() {
             // equal one, whose copies are identical); they are marked dead. Survivors are then
             // read in order.
             let mut map: HashMap<Id, u64, BH> = HashMap::with_capacity_and_hasher(total / 8 + 16, BH::default());
-            let mut dead = vec![0u64; total.div_ceil(64)];
+            let mut dead = filled(total.div_ceil(64), 0u64);
             let kill = |dead: &mut Vec<u64>, g: usize| dead[g >> 6] |= 1u64 << (g & 63);
             for (pi, p) in parts.iter().enumerate() {
                 for (i, r) in p.iter().enumerate() {
@@ -1399,7 +1438,7 @@ fn main() {
 
     // ---- stage 3: sessions per person
     let nthreads = rayon::current_num_threads();
-    let accs: Vec<Mutex<Vec<CAcc>>> = (0..nthreads).map(|_| Mutex::new(vec![CAcc::default(); (ncamp + 1) * ndays])).collect();
+    let accs: Vec<Mutex<Vec<CAcc>>> = (0..nthreads).map(|_| Mutex::new(filled((ncamp + 1) * ndays, CAcc::default()))).collect();
     let user_rows: Vec<Vec<URow>> = ev_r
         .into_par_iter()
         .zip(ck_r.into_par_iter())
@@ -1427,7 +1466,7 @@ fn main() {
                 })
                 .collect();
             let np = persons.len();
-            let mut eoff = vec![0u32; np + 1];
+            let mut eoff = filled(np + 1, 0u32);
             for &x in &eix {
                 eoff[x as usize + 1] += 1;
             }
@@ -1446,7 +1485,7 @@ fn main() {
             drop(eix);
             // clicks of persons without events are irrelevant
             let cix: Vec<u32> = cls.iter().map(|c| pidx.get(&c.key).copied().unwrap_or(u32::MAX)).collect();
-            let mut coff = vec![0u32; np + 1];
+            let mut coff = filled(np + 1, 0u32);
             for &x in &cix {
                 if x != u32::MAX {
                     coff[x as usize + 1] += 1;
@@ -1589,6 +1628,8 @@ fn main() {
 
     write_outputs(&out, user_rows, &total, &camps, ncamp, ndays, day0, &cats);
     log!(t0, "done");
+    release_regions();
+    log!(t0, "released");
     // Output files are complete (closed by the writers). Skip destructors and exit handlers:
     // mimalloc's exit-time cleanup of the retained memory occasionally stalled ~1.4 s.
     unsafe { libc::_exit(0) };
