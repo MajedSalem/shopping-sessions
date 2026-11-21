@@ -1,0 +1,133 @@
+# Benchmark two commits on a GitHub x86-64 Linux runner (started by hand):
+#   gh workflow run bench.yml -f base=<commit> [-f head=<commit>] [-f events=20] [-f rounds=5] [-f profile=true]
+# Builds both commits as the Dockerfile does, generates data with the organizers' published
+# generator, runs base and head interleaved, checks both wrote identical tables, and
+# optionally profiles head with perf. Results: the run's summary page and the artifact.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base commit"
+        required: true
+        default: "16e8687"
+      head:
+        description: "Head commit (empty: the branch tip)"
+        required: false
+        default: ""
+      events:
+        description: "Events in millions (clicks are a quarter of that)"
+        required: false
+        default: "20"
+      rounds:
+        description: "Interleaved rounds"
+        required: false
+        default: "5"
+      seed:
+        description: "Generator seed"
+        required: false
+        default: "7"
+      profile:
+        description: "Also profile head with perf"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      BASE_REF: ${{ inputs.base }}
+      HEAD_REF: ${{ inputs.head }}
+      EVENTS_M: ${{ inputs.events }}
+      ROUNDS: ${{ inputs.rounds }}
+      SEED: ${{ inputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Machine
+        run: |
+          {
+            echo "### Machine"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|L2 cache|L3 cache' || true
+            grep -q avx512f /proc/cpuinfo && echo "AVX-512: yes" || echo "AVX-512: no"
+            free -g | head -2
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build base and head
+        run: |
+          set -eu
+          [ -n "$HEAD_REF" ] || HEAD_REF=$(git rev-parse HEAD)
+          for side in base head; do
+            ref=$BASE_REF; [ "$side" = head ] && ref=$HEAD_REF
+            sha=$(git rev-parse --verify "$ref^{commit}")
+            echo "$side = $sha" | tee -a "$GITHUB_STEP_SUMMARY"
+            git worktree add --detach "/tmp/src_$side" "$sha"
+            (cd "/tmp/src_$side" && cargo build --release --locked 2>&1 | tail -2)
+            cp "/tmp/src_$side/target/release/sessions" "/tmp/bin_$side"
+          done
+          echo "HEAD_SHA=$(git rev-parse --verify "$HEAD_REF^{commit}")" >> "$GITHUB_ENV"
+
+      - name: Generate data (organizers' published generator)
+        run: |
+          set -eu
+          curl -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/gen.zip
+          mkdir -p /tmp/gen && unzip -q /tmp/gen.zip -d /tmp/gen
+          dir=$(dirname "$(find /tmp/gen -maxdepth 3 -name Cargo.toml | head -1)")
+          (cd "$dir" && cargo build --release 2>&1 | tail -1)
+          clicks=$((EVENTS_M * 250))000
+          /usr/bin/time -f "generated in %e s" "$dir/target/release/generate" --seed "$SEED" --events "${EVENTS_M}000000" --clicks "$clicks" --output /tmp/data > /dev/null
+          du -sh /tmp/data | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Benchmark (interleaved)
+        run: |
+          set -eu
+          mkdir -p /tmp/report/logs
+          echo "## ${EVENTS_M}M events, seed $SEED" >> "$GITHUB_STEP_SUMMARY"
+          OUT_BASE=/tmp/report/out_base OUT_HEAD=/tmp/report/out_head LOG_DIR=/tmp/report/logs \
+            bash scripts/ci_bench.sh /tmp/bin_base /tmp/bin_head /tmp/data "$ROUNDS" /tmp/report/bench.md
+          cat /tmp/report/bench.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Same output
+        run: |
+          set -eu
+          python3 -m pip install --quiet polars
+          cd scripts
+          if python3 compare.py /tmp/report/out_base /tmp/report/out_head > /tmp/report/same.txt; then res=MATCH; else res=DIFFER; fi
+          { echo "### Base vs head output: **$res**"; echo '```'; tail -4 /tmp/report/same.txt; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -rf /tmp/report/out_base /tmp/report/out_head
+
+      - name: Profile head (perf)
+        if: ${{ inputs.profile }}
+        run: |
+          set -eu
+          sudo apt-get install -y -qq "linux-tools-$(uname -r)" linux-tools-common > /dev/null || sudo apt-get install -y -qq linux-tools-azure > /dev/null
+          sudo sysctl -q kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
+          # head again with line tables and frame pointers, same optimisation
+          (cd /tmp/src_head && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" \
+            cargo build --release --locked --target-dir /tmp/target_prof 2>&1 | tail -1)
+          rm -rf /tmp/pout && mkdir /tmp/pout
+          perf record -F 1999 -g -o /tmp/perf.data -- env DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/pout NCPU="$(nproc)" /tmp/target_prof/release/sessions 2> /dev/null
+          perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -40 > /tmp/report/perf_symbols.txt
+          perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2> /dev/null | grep -E '^ +[0-9]' | head -60 > /tmp/report/perf_lines.txt
+          { echo "### perf: hottest symbols (head)"; echo '```'; head -25 /tmp/report/perf_symbols.txt; echo '```';
+            echo "### perf: hottest source lines (head)"; echo '```'; head -40 /tmp/report/perf_lines.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.run_id }}
+          path: /tmp/report
+          retention-days: 30
