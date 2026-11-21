@@ -2,7 +2,7 @@
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -824,24 +824,29 @@ fn key128(s: &[u8]) -> u128 {
 
 // ---------------------------------------------------------------- records
 
-/// One parsed copy of an event. `ts == INVALID` marks an invalid (or late) copy.
+/// One parsed copy of an event, for dedup, in its event-id partition. A valid copy's event is
+/// already in its person's partition at `rec` (an `off16`); an invalid or late copy has
+/// `rec == NO_REC` but still takes part, since dedup comes before validation.
 #[derive(Clone, Copy)]
-struct EvRaw {
+struct DRec {
     eid: Id,
-    user: Id,
     ingest: u32, // seconds since epoch
-    ts: u32,     // ms since window_start
-    pc: u32,     // price | cat << 24 (price 0 for non-purchases)
+    rec: u32,
 }
+
+/// `SessEv::ts` of an event that lost dedup.
 const INVALID: u32 = u32::MAX;
 
-/// A surviving event. `key` is the user id until resolved, then the person (their name).
+/// A valid copy of an event, written once to its person's partition while parsing. `ts` is
+/// set to INVALID in place if dedup finds the copy isn't the kept one.
 #[derive(Clone, Copy)]
 struct SessEv {
-    key: Id,
-    ts: u32,
-    pc: u32,
+    key: Id, // the person (their name)
+    ts: u32, // ms since window_start
+    pc: u32, // price | cat << 24 (price 0 for non-purchases)
 }
+
+const _: () = assert!(std::mem::size_of::<DRec>() == 16 && std::mem::size_of::<SessEv>() == 16);
 
 #[derive(Clone, Copy)]
 struct ClickRec {
@@ -904,41 +909,69 @@ fn transpose<T>(v: Vec<Parts<T>>) -> Vec<Vec<Vec<T>>> {
 /// Records of a stream, per partition: a list of slices (chunks) in memory that is never freed.
 type Streams<T> = Vec<Vec<&'static [T]>>;
 
-/// Anonymous memory advised for transparent huge pages, never freed (the process exits with
-/// `_exit`, so the kernel reclaims it in one go).
-fn huge_alloc(bytes: usize) -> *mut u8 {
-    let bytes = bytes.next_multiple_of(2 << 20);
-    unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
-        assert!(p != libc::MAP_FAILED, "mmap failed");
-        if std::env::var_os("NO_HUGEPAGES").is_none() {
-            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
-        }
-        REGIONS.lock().unwrap().push((p as usize, bytes));
-        p as *mut u8
-    }
+/// One reserved range of address space that every partition stream is carved from, advised for
+/// transparent huge pages. Only the pages written are ever backed. Because it is one range,
+/// a 16-byte record anywhere in it is named by a 32-bit offset (`off16`).
+struct Arena {
+    base: usize,
+    size: usize,
+    next: AtomicUsize,
 }
 
-/// Every `huge_alloc` region, so they can be released in parallel just before exit.
-static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+fn arena() -> &'static Arena {
+    static A: std::sync::OnceLock<Arena> = std::sync::OnceLock::new();
+    A.get_or_init(|| {
+        // at most 32 GB, so offsets in 16-byte units stay below u32::MAX (= NO_REC)
+        for gb in [32usize, 16, 8, 4] {
+            let size = gb << 30;
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
+            if p == libc::MAP_FAILED {
+                continue;
+            }
+            // start on a 2 MB boundary, so blocks line up with huge pages
+            let base = (p as usize).next_multiple_of(2 << 20);
+            let size = size - (base - p as usize);
+            if std::env::var_os("NO_HUGEPAGES").is_none() {
+                unsafe { libc::madvise(base as *mut libc::c_void, size, libc::MADV_HUGEPAGE) };
+            }
+            return Arena { base, size, next: AtomicUsize::new(0) };
+        }
+        panic!("cannot reserve the arena");
+    })
+}
+
+/// Memory from the arena (2 MB multiples), never freed: the process exits with `_exit`.
+fn huge_alloc(bytes: usize) -> *mut u8 {
+    let bytes = bytes.next_multiple_of(2 << 20);
+    let a = arena();
+    let off = a.next.fetch_add(bytes, Relaxed);
+    assert!(off + bytes <= a.size, "arena exhausted");
+    (a.base + off) as *mut u8
+}
+
+/// A record's offset in the arena, in 16-byte units.
+#[inline(always)]
+fn off16<T>(p: *const T) -> u32 {
+    ((p as usize - arena().base) >> 4) as u32
+}
+
+/// No person record (the copy was invalid or late).
+const NO_REC: u32 = u32::MAX;
 
 /// The kernel tears a process's memory down on one thread after `_exit`, and that time is
 /// still on the clock. `MADV_DONTNEED` only takes the address-space lock shared, so the
-/// threads drop the big regions' pages concurrently and exit is left with empty mappings.
-/// Call only when no region is used any more. `NO_RELEASE=1` skips it.
+/// threads drop the arena's pages concurrently and exit is left with an empty mapping.
+/// Call only when nothing in the arena is used any more. `NO_RELEASE=1` skips it.
 fn release_regions() {
     if std::env::var_os("NO_RELEASE").is_some() {
         return;
     }
-    let regions = std::mem::take(&mut *REGIONS.lock().unwrap());
-    // 8 MB pieces, so the big blocks spread over all threads too
+    let a = arena();
+    let used = a.next.load(Relaxed).min(a.size);
+    // 8 MB pieces, so the work spreads over all threads
     const STEP: usize = 8 << 20;
-    let pieces: Vec<(usize, usize)> = regions
-        .iter()
-        .flat_map(|&(p, n)| (0..n).step_by(STEP).map(move |o| (p + o, STEP.min(n - o))))
-        .collect();
-    pieces.par_iter().for_each(|&(p, n)| unsafe {
-        libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+    (0..used).into_par_iter().step_by(STEP).for_each(|o| unsafe {
+        libc::madvise((a.base + o) as *mut libc::c_void, STEP.min(used - o), libc::MADV_DONTNEED);
     });
 }
 
@@ -956,17 +989,24 @@ const BLOCK_BYTES: usize = 4 << 20;
 /// One thread's write side of a stream with NB partitions. A record goes into its partition's
 /// write-combining buffer (a few cache lines that stay in cache); a full buffer goes to the
 /// partition's chunk with non-temporal stores, so no cache line of fresh output is fetched from
-/// memory only to be overwritten. Chunks are carved from huge-page blocks.
+/// memory only to be overwritten. Chunks are carved from huge-page blocks of the arena.
+///
+/// Every partition always has a current chunk with room for a full buffer (a new one is taken
+/// as soon as one fills), so where a record will land is known when it is pushed (`next_at`).
+/// Chunks never written are address space only.
 struct Writer<T: Copy + 'static> {
     wb: usize,       // records per buffer: a whole number of cache lines, >= 256 bytes
     chunk: usize,    // records per chunk (a multiple of wb)
     bufs: *mut T,    // NB buffers of wb records, 64-byte aligned
     fill: Vec<u32>,  // records in each partition's buffer
-    cur: Vec<(*mut T, usize)>, // each partition's current chunk and records in it
-    done: Vec<Vec<&'static [T]>>,
+    cur: Vec<(*mut T, usize)>, // each partition's current chunk and records in it (< chunk)
+    done: Vec<Vec<Raw<T>>>,
     block: *mut u8,
     block_left: usize,
 }
+
+/// A run of records in the arena, before it may be read as a slice.
+type Raw<T> = (*mut T, usize);
 
 unsafe impl<T: Copy + 'static> Send for Writer<T> {}
 
@@ -980,7 +1020,20 @@ impl<T: Copy + 'static> Writer<T> {
         }
         let chunk = wb * (32768 / (wb * size)).max(1);
         let bufs = huge_alloc(NB * wb * size) as *mut T;
-        Writer { wb, chunk, bufs, fill: vec![0; NB], cur: vec![(std::ptr::null_mut(), 0); NB], done: (0..NB).map(|_| Vec::new()).collect(), block: std::ptr::null_mut(), block_left: 0 }
+        let mut w = Writer { wb, chunk, bufs, fill: vec![0; NB], cur: vec![(std::ptr::null_mut(), 0); NB], done: (0..NB).map(|_| Vec::new()).collect(), block: std::ptr::null_mut(), block_left: 0 };
+        for p in 0..NB {
+            w.take_chunk(p);
+        }
+        w
+    }
+
+    /// Where the next record pushed to partition `p` will be stored.
+    #[inline(always)]
+    fn next_at(&self, p: usize) -> *mut T {
+        unsafe {
+            let (base, used) = *self.cur.get_unchecked(p);
+            base.add(used + *self.fill.get_unchecked(p) as usize)
+        }
     }
 
     #[inline(always)]
@@ -997,11 +1050,8 @@ impl<T: Copy + 'static> Writer<T> {
         }
     }
 
+    /// Gives partition `p` a fresh chunk (the old one, if any, is full and already in `done`).
     fn take_chunk(&mut self, p: usize) {
-        let (base, used) = self.cur[p];
-        if !base.is_null() && used > 0 {
-            self.done[p].push(unsafe { std::slice::from_raw_parts(base, used) });
-        }
         let bytes = self.chunk * std::mem::size_of::<T>();
         if self.block_left < bytes {
             self.block = huge_alloc(BLOCK_BYTES.max(bytes));
@@ -1015,36 +1065,31 @@ impl<T: Copy + 'static> Writer<T> {
     #[inline(never)]
     fn flush(&mut self, p: usize) {
         let (base, used) = self.cur[p];
-        if base.is_null() || used == self.chunk {
-            self.take_chunk(p);
-        }
-        let (base, used) = self.cur[p];
         let bytes = self.wb * std::mem::size_of::<T>();
         unsafe {
             let src = self.bufs.add(p * self.wb) as *const u8;
             let dst = base.add(used) as *mut u8;
             stream_copy(src, dst, bytes);
         }
-        self.cur[p].1 = used + self.wb;
+        let used = used + self.wb;
         self.fill[p] = 0;
+        if used == self.chunk {
+            self.done[p].push((base, used));
+            self.take_chunk(p);
+        } else {
+            self.cur[p].1 = used;
+        }
     }
 
     /// Writes out what is left in the buffers and returns each partition's chunks.
-    fn finish(mut self) -> Vec<Vec<&'static [T]>> {
+    fn finish(mut self) -> Vec<Vec<Raw<T>>> {
         for p in 0..NB {
             let f = self.fill[p] as usize;
-            if f > 0 {
-                let (base, used) = self.cur[p];
-                if base.is_null() || used + f > self.chunk {
-                    self.take_chunk(p);
-                }
-                let (base, used) = self.cur[p];
-                unsafe { std::ptr::copy_nonoverlapping(self.bufs.add(p * self.wb), base.add(used), f) };
-                self.cur[p].1 = used + f;
-            }
             let (base, used) = self.cur[p];
-            if !base.is_null() && used > 0 {
-                self.done[p].push(unsafe { std::slice::from_raw_parts(base, used) });
+            // used < chunk and both are multiples of wb > f, so the rest fits
+            unsafe { std::ptr::copy_nonoverlapping(self.bufs.add(p * self.wb), base.add(used), f) };
+            if used + f > 0 {
+                self.done[p].push((base, used + f));
             }
         }
         store_fence();
@@ -1099,8 +1144,10 @@ impl<T: Copy + 'static> Writers<T> {
         let i = rayon::current_thread_index().unwrap_or(0) % self.w.len();
         f(&mut self.w[i].lock().unwrap())
     }
-    fn finish(self) -> Streams<T> {
-        let mut out: Streams<T> = (0..NB).map(|_| Vec::new()).collect();
+    /// Each partition's runs, not yet readable as slices: a later stage may still write into
+    /// them through raw pointers (dedup marks dead person records). See `readable`.
+    fn finish_raw(self) -> Vec<Vec<Raw<T>>> {
+        let mut out: Vec<Vec<Raw<T>>> = (0..NB).map(|_| Vec::new()).collect();
         for w in self.w {
             for (p, list) in w.into_inner().unwrap().finish().into_iter().enumerate() {
                 out[p].extend(list);
@@ -1108,6 +1155,14 @@ impl<T: Copy + 'static> Writers<T> {
         }
         out
     }
+    fn finish(self) -> Streams<T> {
+        readable(self.finish_raw())
+    }
+}
+
+/// Turns runs into slices, once nothing writes into them any more.
+fn readable<T: Copy + 'static>(raw: Vec<Vec<Raw<T>>>) -> Streams<T> {
+    raw.into_iter().map(|l| l.into_iter().map(|(p, n)| unsafe { std::slice::from_raw_parts(p as *const T, n) }).collect()).collect()
 }
 
 // ---------------------------------------------------------------- links
@@ -1299,47 +1354,43 @@ fn main() {
     let (ev_files, ck_files, ln_files) = (open_csvs(&data.join("events")), open_csvs(&data.join("clicks")), open_csvs(&data.join("links")));
     log!(t0, "setup: {} event files, {} click files, {} link files, ndays {ndays}", ev_files.len(), ck_files.len(), ln_files.len());
 
-    // ---- stage 1: links || (events, clicks) parsing
-    let parse_all = || {
-        let ew = Writers::<EvRaw>::new();
-        for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown, &ew));
-        let s1 = ew.finish();
-        log!(t0, "events parsed");
-        let cw = Writers::<ClickRec>::new();
-        for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map, &cw));
-        let c1 = cw.finish();
-        log!(t0, "clicks parsed");
-        (s1, c1)
-    };
-    // SEQ=1 (diagnostics only): build links first, then parse, to time each on its own.
-    let (links, (stage1, clicks1)) = if std::env::var_os("SEQ").is_some() {
-        let l = build_links(ln_files);
-        log!(t0, "links built");
-        (l, parse_all())
-    } else {
-        rayon::join(
-            || {
-                let l = build_links(ln_files);
-                log!(t0, "links built");
-                l
-            },
-            parse_all,
-        )
-    };
+    // ---- stage 1: links, so that parsing can file every event and click under its person
+    let links = build_links(ln_files);
+    log!(t0, "links built");
 
-    // ---- stage 2: dedup events on event_id (smallest ingest), keep valid ones, by user bucket
-    let sw = Writers::<SessEv>::new();
+    // ---- stage 2: parse. Events go once to their person's partition (valid copies) and every
+    // copy to its event-id partition (for dedup); clicks go to their person's partition.
+    let dw = Writers::<DRec>::new();
+    let pw = Writers::<SessEv>::new();
+    for_each_piece(&ev_files, |c| parse_events(c, ws, we, &prod_map, unknown, &links, &dw, &pw));
+    let stage1 = dw.finish();
+    let person_evs = pw.finish_raw();
+    log!(t0, "events parsed");
+    let cw = Writers::<ClickRec>::new();
+    for_each_piece(&ck_files, |c| parse_clicks(c, cws, we, &camp_map, &links, &cw));
+    let ck_r = cw.finish();
+    log!(t0, "clicks parsed");
+    drop(links);
+
+    // ---- stage 3: dedup on event_id. Keep the copy with the smallest ingest; every other copy
+    // that has a person record gets it marked dead in place. A kept copy that was invalid has
+    // none, so the event is gone, and later valid copies are dead.
+    let abase = arena().base;
+    let kill = |rec: u32| {
+        if rec != NO_REC {
+            // SAFETY: `rec` names a SessEv this run wrote into the arena; its partition is
+            // not read until this stage ends, and each record is written by one task only
+            // (all copies of an event are in the same event-id partition).
+            unsafe {
+                let p = (abase + ((rec as usize) << 4)) as *mut SessEv;
+                std::ptr::addr_of_mut!((*p).ts).write(INVALID);
+            }
+        }
+    };
     stage1
         .into_par_iter()
         .for_each(|parts| {
             let total: usize = parts.iter().map(|p| p.len()).sum();
-            // global index of a record within this bucket = base[part] + index in part
-            let mut base = Vec::with_capacity(parts.len());
-            let mut acc = 0usize;
-            for p in &parts {
-                base.push(acc);
-                acc += p.len();
-            }
             // Filter: a 2-bit saturating counter per slot (16+ slots per copy, so it stays in
             // L2). Only copies whose slot was hit more than once can have another copy of their
             // event; just those go through the exact map (real duplicates plus a few chance
@@ -1359,84 +1410,37 @@ fn main() {
                 let s = mix(id) as usize & smask;
                 (cnt[s >> 5] >> ((s & 31) * 2)) & 3 >= 2
             };
-            // The map finds the losing copies among the suspects (a later ingest_ts, or an
-            // equal one, whose copies are identical); they are marked dead. Survivors are then
-            // read in order.
+            // The map keeps the best copy so far of each suspect event (ingest << 32 | rec) and
+            // kills the others: a later ingest_ts, or an equal one (whose copies are identical).
             let mut map: HashMap<Id, u64, BH> = HashMap::with_capacity_and_hasher(total / 8 + 16, BH::default());
-            let mut dead = filled(total.div_ceil(64), 0u64);
-            let kill = |dead: &mut Vec<u64>, g: usize| dead[g >> 6] |= 1u64 << (g & 63);
-            for (pi, p) in parts.iter().enumerate() {
-                for (i, r) in p.iter().enumerate() {
+            for p in &parts {
+                for r in p.iter() {
                     if !suspect(r.eid) {
                         continue;
                     }
-                    let g = base[pi] + i;
+                    let mine = ((r.ingest as u64) << 32) | r.rec as u64;
                     match map.entry(r.eid) {
                         hashbrown::hash_map::Entry::Occupied(mut o) => {
                             let cur = *o.get();
-                            let (cp, ci) = ((cur >> 32) as usize, (cur & 0xffff_ffff) as usize);
-                            if r.ingest < parts[cp][ci].ingest {
-                                kill(&mut dead, base[cp] + ci);
-                                *o.get_mut() = ((pi as u64) << 32) | i as u64;
+                            if r.ingest < (cur >> 32) as u32 {
+                                kill(cur as u32);
+                                *o.get_mut() = mine;
                             } else {
-                                kill(&mut dead, g);
+                                kill(r.rec);
                             }
                         }
                         hashbrown::hash_map::Entry::Vacant(e) => {
-                            e.insert(((pi as u64) << 32) | i as u64);
+                            e.insert(mine);
                         }
                     }
                 }
             }
-            drop(map);
-            sw.with(|w| {
-                for (pi, p) in parts.iter().enumerate() {
-                    let b0 = base[pi];
-                    for (i, r) in p.iter().enumerate() {
-                        let g = b0 + i;
-                        if r.ts == INVALID || (dead[g >> 6] >> (g & 63)) & 1 != 0 {
-                            continue;
-                        }
-                        w.push(bucket(r.user), SessEv { key: r.user, ts: r.ts, pc: r.pc });
-                    }
-                }
-            });
         });
-    let stage2 = sw.finish();
     log!(t0, "events deduped");
+    // dedup has finished writing into the person partitions
+    let ev_r = readable(person_evs);
 
-    // ---- resolve user id -> person, re-bucket by person
-    let rew = Writers::<SessEv>::new();
-    let rcw = Writers::<ClickRec>::new();
-    stage2
-        .into_par_iter()
-        .zip(clicks1.into_par_iter())
-        .enumerate()
-        .for_each(|(b, (eparts, cparts))| {
-            rew.with(|w| {
-                for p in eparts {
-                    for &e0 in p {
-                        let mut e = e0;
-                        e.key = resolve(&links, b, e.key);
-                        w.push(bucket(e.key), e);
-                    }
-                }
-            });
-            rcw.with(|w| {
-                for p in cparts {
-                    for &c0 in p {
-                        let mut c = c0;
-                        c.key = resolve(&links, b, c.key);
-                        w.push(bucket(c.key), c);
-                    }
-                }
-            });
-        });
-    let ev_r = rew.finish();
-    let ck_r = rcw.finish();
-    log!(t0, "persons resolved");
-
-    // ---- stage 3: sessions per person
+    // ---- stage 4: sessions per person
     let nthreads = rayon::current_num_threads();
     let accs: Vec<Mutex<Vec<CAcc>>> = (0..nthreads).map(|_| Mutex::new(filled((ncamp + 1) * ndays, CAcc::default()))).collect();
     let user_rows: Vec<Vec<URow>> = ev_r
@@ -1445,7 +1449,8 @@ fn main() {
         .map(|(eparts, cparts)| {
             let mut evs: Vec<SessEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
             for p in eparts {
-                evs.extend_from_slice(p);
+                // events that lost dedup were marked in place
+                evs.extend(p.iter().filter(|e| e.ts != INVALID));
             }
             let mut cls: Vec<ClickRec> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
             for p in cparts {
@@ -1635,8 +1640,10 @@ fn main() {
     unsafe { libc::_exit(0) };
 }
 
-fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, out: &Writers<EvRaw>) {
-    out.with(|w| scan::<7>(c, |f| {
+/// Every copy goes to its event-id partition as a `DRec`; a valid one also goes, once, to its
+/// person's partition as a `SessEv` (the person resolved here through the link maps).
+fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, unknown: u8, links: &[LinkMap], dout: &Writers<DRec>, pout: &Writers<SessEv>) {
+    dout.with(|dw| pout.with(|pw| scan::<7>(c, |f| {
         let eid = f[0];
         if eid.is_empty() {
             return;
@@ -1644,8 +1651,9 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
         let eid = enc(eid);
         let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
-        let mut r = EvRaw { eid, user: Id::default(), ingest, ts: INVALID, pc: 0 };
+        let mut rec = NO_REC;
         'v: {
+            let mut pc = 0u32;
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
@@ -1658,7 +1666,7 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
                 b"purchase" => match parse_price(f[6]) {
                     Some(p) => {
                         let cat = *prod_map.get(&key128(f[5])).unwrap_or(&unknown) as u32;
-                        r.pc = p | (cat << 24);
+                        pc = p | (cat << 24);
                     }
                     None => break 'v,
                 },
@@ -1667,14 +1675,17 @@ fn parse_events(c: &[u8], ws: i64, we: i64, prod_map: &HashMap<u128, u8, BH>, un
             if ingest_ms - ts > DAY {
                 break 'v;
             }
-            r.ts = (ts - ws) as u32;
-            r.user = enc(f[1]);
+            let u = enc(f[1]);
+            let person = resolve(links, bucket(u), u);
+            let pb = bucket(person);
+            rec = off16(pw.next_at(pb));
+            pw.push(pb, SessEv { key: person, ts: (ts - ws) as u32, pc });
         }
-        w.push(bucket(eid), r);
-    }));
+        dw.push(bucket(eid), DRec { eid, ingest, rec });
+    })));
 }
 
-fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, out: &Writers<ClickRec>) {
+fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, links: &[LinkMap], out: &Writers<ClickRec>) {
     out.with(|w| scan::<4>(c, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -1688,7 +1699,8 @@ fn parse_clicks(c: &[u8], cws: i64, we: i64, camp_map: &HashMap<u128, u16, BH>, 
             None => return,
         };
         let u = enc(f[1]);
-        w.push(bucket(u), ClickRec { key: u, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
+        let person = resolve(links, bucket(u), u);
+        w.push(bucket(person), ClickRec { key: person, cid: enc(f[0]), ts: (ts - cws) as u32, camp });
     }));
 }
 
